@@ -1,65 +1,89 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+from pathlib import Path
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star, register
+
+
+@register(
+    "lifeos",
+    "Dad Zhang",
+    "LifeOS 个人数据系统",
+    "0.1.0",
+)
+class LifeOSPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
 
     async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+        """插件初始化"""
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld", alias={'hello', 'hi'})
+    # ----------------------------
+    # HelloWorld 示例
+    # ----------------------------
+    @filter.command("helloworld", alias={"hello", "hi"})
     async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
+        """HelloWorld 测试"""
+
         user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello大作家, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
-    # 注册一个 test 指令
-    @filter.command("test", alias={'测试', 't'})
+        message_str = event.message_str
+
+        logger.info(event.get_messages())
+
+        yield event.plain_result(
+            f"Hello大作家，{user_name}，你发了 {message_str}!"
+        )
+
+    # ----------------------------
+    # Test 示例
+    # ----------------------------
+    @filter.command("test", alias={"测试", "t"})
     async def test(self, event: AstrMessageEvent):
-        """这是一个测试指令"""
+        """测试插件是否正常运行"""
+
         user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello大作家e3,你成功的test! {user_name}, 你发了 {message_str}!")    
-    '''
-    math
-    ├── calc
-    │   ├── add (a(int),b(int),)
-    │   ├── sub (a(int),b(int),)
-    │   ├── help (无参数指令)
-    '''
+        message_str = event.message_str
 
-    @filter.command_group("math")
-    def math():
-        pass
+        logger.info(event.get_messages())
 
-    @math.group("calc") # 请注意，这里是 group，而不是 command_group
-    def calc():
-        pass
+        yield event.plain_result(
+            f"Hello大作家，你成功执行了 Test！\n"
+            f"用户：{user_name}\n"
+            f"输入：{message_str}"
+        )
 
-    @calc.command("add")
-    async def add(self, event: AstrMessageEvent, a: int, b: int):
-        yield event.plain_result(f"结果是: {a + b}")
+    # ----------------------------
+    # 记录
+    # ----------------------------
+    @filter.command("记录")
+    async def record(self, event: AstrMessageEvent):
+        """
+        将输入内容追加写入
+        /root/projects/life-project/Data/mdtest/W1test.md
+        """
 
-    @calc.command("sub")
-    async def sub(self, event: AstrMessageEvent, a: int, b: int):
-        yield event.plain_result(f"结果是: {a - b}")
+        message = event.message_str.strip()
 
-    @calc.command("help")
-    async def calc_help(self, event: AstrMessageEvent):
-        # /math calc help
-        yield event.plain_result("这是一个计算器插件，拥有 add, sub 指令。")
-    
-    @filter.command("help", alias={'帮助', 'helpme'})
-    async def help(self, event: AstrMessageEvent):
-        yield event.plain_result("这是一个计算器插件，拥有 add, sub 指令。")
-    
+        # 去掉命令"记录"
+        content = message[len("记录"):].strip()
+
+        if not content:
+            yield event.plain_result(
+                "请输入要记录的内容。\n例如：\n/记录 7月6日 写了一句话"
+            )
+            return
+
+        data_dir = Path("/root/projects/life-project/Data/mdtest")
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        file_path = data_dir / "W1test.md"
+
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(content + "\n")
+
+        logger.info(f"LifeOS 已记录：{content}")
+
+        yield event.plain_result("✅ 已成功记录。")
+
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        """插件卸载时调用"""
