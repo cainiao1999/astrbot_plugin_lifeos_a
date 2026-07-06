@@ -17,20 +17,15 @@ from astrbot.api.star import Context, Star, register
 class LifeOSPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
-        # 配置：从 _conf_schema.json 读取
         self.config = config or {}
         self.data_path = Path(self.config.get('data_path', '/data/lifeos/Data'))
         self.config_path = Path(self.config.get('config_path', '/data/lifeos/Config'))
 
     async def initialize(self):
         """插件初始化：创建目录结构，复制默认规则"""
-        # 创建目录
         self.data_path.mkdir(parents=True, exist_ok=True)
         self.config_path.mkdir(parents=True, exist_ok=True)
-
-        # 首次启动：复制默认规则到配置目录
         self._ensure_rule_files()
-
         logger.info(f"LifeOS 初始化完成")
         logger.info(f"  数据目录：{self.data_path}")
         logger.info(f"  配置目录：{self.config_path}")
@@ -43,7 +38,6 @@ class LifeOSPlugin(Star):
         if not default_rules_dir.exists():
             logger.warning(f"默认规则目录不存在：{default_rules_dir}")
             return
-
         for rule_file in default_rules_dir.iterdir():
             if rule_file.suffix == '.md':
                 target = self.config_path / rule_file.name
@@ -59,6 +53,29 @@ class LifeOSPlugin(Star):
             return ''
         return path.read_text(encoding='utf-8')
 
+    # ──────────── 消息拆分 ────────────
+
+    def _split_activities(self, text: str) -> list:
+        """
+        将一条包含多个活动的消息拆分为独立描述。
+        例如："写了A，读了B" → ["写了A", "读了B"]
+        """
+        # 按常见的并列连接词拆分
+        # 优先级：先尝试按行为关键词拆分
+        split_pattern = (
+            r'(?<=[，,。.！!？?；;])'   # 在标点之后
+            r'\s*'
+            r'(?=(?:我)?(?:今天)?(?:写了|码了|码字|写作|在写|完成了|写了稿|更了|读了|看了|阅读|在读|在看|翻看))'
+        )
+        parts = re.split(split_pattern, text)
+        parts = [p.strip() for p in parts if p.strip()]
+
+        # 如果拆分后只有一段，说明没有明显分隔，整段返回
+        if len(parts) <= 1:
+            return [text.strip()]
+
+        return parts
+
     # ──────────── LLM 调用 ────────────
 
     async def _call_llm(self, rule_text: str, user_input: str) -> str:
@@ -66,10 +83,15 @@ class LifeOSPlugin(Star):
         将规则 + 用户输入发给 LLM，返回生成的 Markdown。
         如果 LLM 不可用，自动降级为本地规则匹配。
         """
+        now = datetime.now().strftime('%H:%M')
         system_prompt = (
             "你是 LifeOS 记录助手。请严格按照下方规则，"
-            "将用户的自然语言描述转换为标准格式。\n"
-            "只输出 Markdown，不要添加任何额外说明。"
+            "将用户的自然语言描述转换为标准格式。\n\n"
+            "重要规则：\n"
+            "1. 时间统一使用当前系统时间：" + now + "\n"
+            "2. 如果用户一条消息中包含多个活动（如既写了又读了），"
+            "请分别输出多个条目，条目之间用空行隔开。\n"
+            "3. 只输出 Markdown，不要添加任何额外说明、注释或问候语。"
         )
 
         user_prompt = (
@@ -77,10 +99,9 @@ class LifeOSPlugin(Star):
             f"{rule_text}\n\n"
             f"## 用户输入\n\n"
             f"{user_input}\n\n"
-            f"请根据上述规则转换。"
+            f"请根据上述规则转换。注意：如果包含多个活动，请分别输出。"
         )
 
-        # 尝试获取 LLM 提供商
         try:
             provider = self.context.get_llm()
             if provider:
@@ -93,16 +114,25 @@ class LifeOSPlugin(Star):
         except Exception as e:
             logger.warning(f"LLM 调用失败，降级为本地解析：{e}")
 
-        # 降级：本地规则解析（方便无 LLM 时也能用）
-        return self._local_parse(user_input)
+        # 降级：本地解析
+        return self._local_parse_all(user_input)
 
-    # ──────────── 本地解析降级 ────────────
+    # ──────────── 本地解析（支持多活动） ────────────
 
-    def _local_parse(self, text: str) -> str:
-        """当 LLM 不可用时的本地规则解析降级方案"""
+    def _local_parse_all(self, text: str) -> str:
+        """本地解析：先拆分多活动，再分别解析，最后合并"""
+        activities = self._split_activities(text)
+        entries = []
         now = datetime.now().strftime('%H:%M')
 
-        # 判断行为类型
+        for activity in activities:
+            entry = self._local_parse_single(activity, now)
+            entries.append(entry)
+
+        return '\n'.join(entries)
+
+    def _local_parse_single(self, text: str, now: str) -> str:
+        """解析单个活动描述"""
         writing_kw = ['写了', '码了', '码字', '写作', '在写', '完成了', '写了稿', '更了']
         reading_kw = ['读了', '看了', '阅读', '在读', '在看', '翻看']
 
@@ -160,16 +190,16 @@ class LifeOSPlugin(Star):
 
         lines.append(f'写作时长：{duration}' if duration is not None else '写作时长：')
         lines.append('')
-
         lines.append(f'产出字数：{word_count}' if word_count is not None else '产出字数：')
         lines.append('')
 
         # 作品名
         m = re.search(r'《([^》]+)》', text)
         work = m.group(1) if m else ''
-        m2 = re.search(r'"([^"]+)"', text)
-        if not work and m2:
-            work = m2.group(1)
+        if not work:
+            m = re.search(r'"([^"]+)"', text)
+            if m:
+                work = m.group(1)
         lines.append(f'产出作品：{work}')
         lines.append('')
 
@@ -244,7 +274,6 @@ class LifeOSPlugin(Star):
         lines.append('行为：其他')
         lines.append('')
 
-        # 时长（小时）
         duration = None
         note = text
         m = re.search(r'(\d+(?:\.\d+)?)\s*(小时|h)', text)
@@ -270,8 +299,8 @@ class LifeOSPlugin(Star):
 
     # ──────────── 文件写入 ────────────
 
-    def _write_record(self, markdown_entry: str) -> Path:
-        """将 Markdown 条目追加到当日数据文件"""
+    def _write_records(self, markdown_text: str) -> Path:
+        """将 Markdown 条目（可能多条）追加到当日数据文件"""
         today = datetime.now().strftime('%Y-%m-%d')
         file_path = self.data_path / f'{today}.md'
 
@@ -279,56 +308,42 @@ class LifeOSPlugin(Star):
         with open(file_path, 'a', encoding='utf-8') as f:
             if is_new:
                 f.write(f'# {today}\n\n')
-            f.write(markdown_entry.strip() + '\n\n')
+            f.write(markdown_text.strip() + '\n\n')
 
         logger.info(f'LifeOS 写入记录：{file_path}')
         return file_path
 
     # ──────────── 命令入口 ────────────
 
-    # ----------------------------
-    # HelloWorld 示例
-    # ----------------------------
     @filter.command("helloworld", alias={"hello", "hi"})
     async def helloworld(self, event: AstrMessageEvent):
         """HelloWorld 测试"""
         user_name = event.get_sender_name()
         message_str = event.message_str
-
         logger.info(event.get_messages())
-
         yield event.plain_result(
             f"Hello大作家，{user_name}，你发了 {message_str}!"
         )
 
-    # ----------------------------
-    # Test 示例
-    # ----------------------------
     @filter.command("test", alias={"测试", "t"})
     async def test(self, event: AstrMessageEvent):
         """测试插件是否正常运行"""
         user_name = event.get_sender_name()
         message_str = event.message_str
-
         logger.info(event.get_messages())
-
         yield event.plain_result(
             f"Hello大作家，你成功执行了 Test！\n"
             f"用户：{user_name}\n"
             f"输入：{message_str}"
         )
 
-    # ----------------------------
-    # 记录（核心功能）
-    # ----------------------------
     @filter.command("记录")
     async def record(self, event: AstrMessageEvent):
         """
-        记录活动：读取规则 → 调用 LLM → 写入文件
+        记录活动：读取规则 → 调用 LLM/本地解析 → 写入文件
+        支持一条消息中包含多个活动。
         """
         message = event.message_str.strip()
-
-        # 去掉命令前缀
         content = message[len("记录"):].strip()
 
         if not content:
@@ -337,6 +352,7 @@ class LifeOSPlugin(Star):
                 "例如：\n"
                 "  /记录 写了《嘉豪》正文1小时，1800字\n"
                 "  /记录 读了《蛊真人》精读2小时12章\n"
+                "  /记录 写了A1小时，读了B2章\n"
                 "  /记录 今天重新部署了AstrBot"
             )
             return
@@ -357,11 +373,13 @@ class LifeOSPlugin(Star):
             return
 
         # 4. 写入文件
-        file_path = self._write_record(generated)
+        file_path = self._write_records(generated)
 
-        # 5. 回复用户
+        # 5. 统计写入的条目数
+        entry_count = generated.count('---') // 2  # 每对 --- ... --- 算一个条目
+
         yield event.plain_result(
-            f"✅ 已记录！\n"
+            f"✅ 已记录！共 {entry_count} 条\n"
             f"📂 {file_path}"
         )
 
