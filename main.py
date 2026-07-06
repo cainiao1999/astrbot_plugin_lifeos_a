@@ -58,9 +58,7 @@ class LifeOSPlugin(Star):
     def _split_activities(self, text: str) -> list:
         """
         将一条包含多个活动的消息拆分为独立描述。
-        例如："写了A，读了B" → ["写了A", "读了B"]
         """
-        # 按标点 + 行为关键词拆分
         split_pattern = (
             r'(?<=[，,。.！!？?；;])'
             r'\s*'
@@ -77,12 +75,13 @@ class LifeOSPlugin(Star):
             return [text.strip()]
         return parts
 
-    # ──────────── LLM 调用（只处理单个活动） ────────────
+    # ──────────── LLM 调用（官方正确 API） ────────────
 
-    async def _call_llm_single(self, rule_text: str, activity_text: str) -> str:
+    async def _call_llm_single(self, event: AstrMessageEvent, rule_text: str, activity_text: str) -> str:
         """
         将单个活动的描述发给 LLM，返回生成的 Markdown。
-        LLM 不需要操心时间，也不需要考虑多活动。
+        使用 AstrBot 官方推荐的 v4.5.7+ API。
+        返回 None 表示 LLM 不可用/出错。
         """
         system_prompt = (
             "你是 LifeOS 记录助手。请严格按照下方规则，"
@@ -100,14 +99,27 @@ class LifeOSPlugin(Star):
         )
 
         try:
-            provider = self.context.get_llm()
-            if provider:
-                response = await provider.text_chat(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                )
-                if response and response.strip():
-                    return response.strip()
+            # 获取当前会话的 LLM 提供商 ID
+            umo = event.unified_msg_origin
+            provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+
+            if not provider_id:
+                logger.warning("未获取到 LLM 提供商 ID，降级为本地解析")
+                return None
+
+            # 调用 LLM（官方推荐 API）
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=(
+                    f"{system_prompt}\n\n"
+                    f"{user_prompt}"
+                ),
+            )
+
+            if llm_resp and hasattr(llm_resp, 'completion_text') and llm_resp.completion_text.strip():
+                logger.info(f"LLM 调用成功")
+                return llm_resp.completion_text.strip()
+
         except Exception as e:
             logger.warning(f"LLM 调用失败，降级为本地解析：{e}")
 
@@ -117,11 +129,9 @@ class LifeOSPlugin(Star):
 
     def _force_current_time(self, markdown_text: str) -> str:
         """
-        将 LLM 返回的 Markdown 中的所有时间行替换为当前系统时间。
-        这是关键修复：LLM 的时间永远是错的，本地强制覆盖。
+        将 Markdown 中的所有时间行替换为当前系统时间。
         """
         now = datetime.now().strftime('%H:%M')
-        # 替换 "时间：任意内容" → "时间：当前时间"
         return re.sub(r'时间：.*', f'时间：{now}', markdown_text)
 
     # ──────────── 本地解析降级（单个活动） ────────────
@@ -152,17 +162,44 @@ class LifeOSPlugin(Star):
         lines.append('行为：写')
         lines.append('')
 
-        duration = None
+        # ---- 提取时长（支持同时有小时和分钟） ----
+        total_hours = 0.0
+        has_duration = False
+
         m = re.search(r'(\d+(?:\.\d+)?)\s*(小时|h)', text)
         if m:
-            duration = float(m.group(1))
+            total_hours += float(m.group(1))
+            has_duration = True
+
         m = re.search(r'(\d+(?:\.\d+)?)\s*(分钟|min)', text)
         if m:
-            duration = round(float(m.group(1)) / 60, 2)
-        m = re.search(r'半\s*(小时|h)', text)
-        if m:
-            duration = 0.5
+            total_hours += float(m.group(1)) / 60
+            has_duration = True
 
+        # 中文数字：三小时、五小时
+        cn_num_map = {
+            '零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5,
+            '六': 6, '七': 7, '八': 8, '九': 9, '十': 10, '半': 0.5,
+        }
+        m = re.search(r'([一二两三四五六七八九十半])\s*(小时|h)', text)
+        if m:
+            cn_char = m.group(1)
+            if cn_char == '半':
+                total_hours += 0.5
+            elif cn_char == '十':
+                total_hours += 10
+            else:
+                total_hours += cn_num_map.get(cn_char, 0)
+            has_duration = True
+
+        # 半小时
+        if re.search(r'半\s*(小时|h)', text) and not has_duration:
+            total_hours += 0.5
+            has_duration = True
+
+        duration = round(total_hours, 2) if has_duration else None
+
+        # ---- 提取字数 ----
         word_count = None
         m = re.search(r'(\d+(?:\.\d+)?)\s*(万字|千字|字)', text)
         if m:
@@ -174,6 +211,7 @@ class LifeOSPlugin(Star):
             else:
                 word_count = int(v)
 
+        # 校验
         if duration is None and word_count is None:
             return ('---ERROR---\n'
                     '写作时长和产出字数不能同时为空，烦请作者大大补充。\n'
@@ -208,17 +246,42 @@ class LifeOSPlugin(Star):
         lines.append('行为：读')
         lines.append('')
 
-        duration = None
+        # ---- 提取时长（支持同时有小时和分钟） ----
+        total_hours = 0.0
+        has_duration = False
+
         m = re.search(r'(\d+(?:\.\d+)?)\s*(小时|h)', text)
         if m:
-            duration = float(m.group(1))
+            total_hours += float(m.group(1))
+            has_duration = True
+
         m = re.search(r'(\d+(?:\.\d+)?)\s*(分钟|min)', text)
         if m:
-            duration = round(float(m.group(1)) / 60, 2)
-        m = re.search(r'半\s*(小时|h)', text)
-        if m:
-            duration = 0.5
+            total_hours += float(m.group(1)) / 60
+            has_duration = True
 
+        cn_num_map = {
+            '零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5,
+            '六': 6, '七': 7, '八': 8, '九': 9, '十': 10, '半': 0.5,
+        }
+        m = re.search(r'([一二两三四五六七八九十半])\s*(小时|h)', text)
+        if m:
+            cn_char = m.group(1)
+            if cn_char == '半':
+                total_hours += 0.5
+            elif cn_char == '十':
+                total_hours += 10
+            else:
+                total_hours += cn_num_map.get(cn_char, 0)
+            has_duration = True
+
+        if re.search(r'半\s*(小时|h)', text) and not has_duration:
+            total_hours += 0.5
+            has_duration = True
+
+        duration = round(total_hours, 2) if has_duration else None
+
+        # ---- 章节 ----
         chapters = None
         m = re.search(r'(\d+(?:\.\d+)?)\s*章', text)
         if m:
@@ -258,20 +321,46 @@ class LifeOSPlugin(Star):
         lines.append('行为：其他')
         lines.append('')
 
-        duration = None
+        total_hours = 0.0
+        has_duration = False
         note = text
+
         m = re.search(r'(\d+(?:\.\d+)?)\s*(小时|h)', text)
         if m:
-            duration = float(m.group(1))
-            note = re.sub(r'\d+(?:\.\d+)?\s*(?:小时|h)', '', note).strip()
+            total_hours += float(m.group(1))
+            has_duration = True
+
         m = re.search(r'(\d+(?:\.\d+)?)\s*(分钟|min)', text)
         if m:
-            duration = round(float(m.group(1)) / 60, 2)
-            note = re.sub(r'\d+(?:\.\d+)?\s*(?:分钟|min)', '', note).strip()
-        m = re.search(r'半\s*(小时|h)', text)
+            total_hours += float(m.group(1)) / 60
+            has_duration = True
+
+        cn_num_map = {
+            '零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5,
+            '六': 6, '七': 7, '八': 8, '九': 9, '十': 10, '半': 0.5,
+        }
+        m = re.search(r'([一二两三四五六七八九十半])\s*(小时|h)', text)
         if m:
-            duration = 0.5
-            note = re.sub(r'半\s*(?:小时|h)', '', note).strip()
+            cn_char = m.group(1)
+            if cn_char == '半':
+                total_hours += 0.5
+            elif cn_char == '十':
+                total_hours += 10
+            else:
+                total_hours += cn_num_map.get(cn_char, 0)
+            has_duration = True
+
+        if re.search(r'半\s*(小时|h)', text) and not has_duration:
+            total_hours += 0.5
+            has_duration = True
+
+        duration = round(total_hours, 2) if has_duration else None
+
+        if duration is not None:
+            note = re.sub(
+                r'\d+(?:\.\d+)?\s*(?:小时|分钟|h|min)|[一二两三四五六七八九十半]\s*(?:小时|h)',
+                '', note
+            ).strip()
 
         lines.append(f'时长：{duration}' if duration is not None else '时长：')
         lines.append('')
@@ -283,39 +372,39 @@ class LifeOSPlugin(Star):
 
     # ──────────── 核心处理管道 ────────────
 
-    async def _process_activities(self, rule_text: str, raw_input: str) -> str:
+    async def _process_activities(self, event: AstrMessageEvent, rule_text: str, raw_input: str) -> tuple:
         """
-        处理一条可能包含多个活动的输入：
-        1. 本地拆分活动
-        2. 每个活动逐个处理（优先 LLM → 降级本地）
-        3. 强制覆盖为当前系统时间
-        4. 合并所有条目的 Markdown
+        处理一条可能包含多个活动的输入。
+        返回: (合并后的Markdown, 各活动的处理方式列表)
         """
         now = datetime.now().strftime('%H:%M')
         activities = self._split_activities(raw_input)
         all_entries = []
+        methods = []
 
-        for activity in activities:
-            # 尝试 LLM（只传单个活动）
-            llm_result = await self._call_llm_single(rule_text, activity)
+        for i, activity in enumerate(activities):
+            # 尝试 LLM（传 event 用于获取 provider_id）
+            llm_result = await self._call_llm_single(event, rule_text, activity)
 
             if llm_result and '---ERROR---' not in llm_result:
-                # LLM 成功：强制修正时间
                 entry = self._force_current_time(llm_result)
+                methods.append('LLM')
             else:
-                # LLM 失败或无结果：本地解析
                 entry = self._local_parse_single(activity, now)
+                if llm_result is None:
+                    methods.append('本地(LLM不可用)')
+                else:
+                    methods.append('本地(LLM返回异常)')
 
             all_entries.append(entry)
 
-        # 合并所有条目
         combined = '\n'.join(all_entries)
-        return combined
+        return combined, methods
 
     # ──────────── 文件写入 ────────────
 
     def _write_records(self, markdown_text: str) -> Path:
-        """将 Markdown 条目（可能多条）追加到当日数据文件"""
+        """将 Markdown 条目追加到当日数据文件"""
         today = datetime.now().strftime('%Y-%m-%d')
         file_path = self.data_path / f'{today}.md'
 
@@ -377,12 +466,11 @@ class LifeOSPlugin(Star):
             yield event.plain_result("⚠️ 规则文件 record_rule.md 未找到，请检查配置。")
             return
 
-        # 2. 核心处理：拆分 → 逐条处理 → 强制本地时间
-        generated = await self._process_activities(rule_text, content)
+        # 2. 核心处理（传入 event）
+        generated, methods = await self._process_activities(event, rule_text, content)
 
         # 3. 检查错误
         if '---ERROR---' in generated:
-            # 提取所有错误信息
             errors = re.findall(r'---ERROR---\n(.*?)\n---ERROR---', generated, re.DOTALL)
             error_msg = '\n'.join(e.strip() for e in errors)
             yield event.plain_result(f"⚠️ {error_msg}")
@@ -394,8 +482,12 @@ class LifeOSPlugin(Star):
         # 5. 统计条目数
         entry_count = generated.count('---') // 2
 
+        # 6. 拼接处理方式说明
+        method_info = ' | '.join([f'活动{i+1}: {m}' for i, m in enumerate(methods)])
+
         yield event.plain_result(
             f"✅ 已记录！共 {entry_count} 条\n"
+            f"🔧 {method_info}\n"
             f"📂 {file_path}"
         )
 
