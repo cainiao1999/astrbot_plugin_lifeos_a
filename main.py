@@ -53,53 +53,50 @@ class LifeOSPlugin(Star):
             return ''
         return path.read_text(encoding='utf-8')
 
-    # ──────────── 消息拆分 ────────────
+    # ──────────── 消息拆分（本地，不依赖 LLM） ────────────
 
     def _split_activities(self, text: str) -> list:
         """
         将一条包含多个活动的消息拆分为独立描述。
         例如："写了A，读了B" → ["写了A", "读了B"]
         """
-        # 按常见的并列连接词拆分
-        # 优先级：先尝试按行为关键词拆分
+        # 按标点 + 行为关键词拆分
         split_pattern = (
-            r'(?<=[，,。.！!？?；;])'   # 在标点之后
+            r'(?<=[，,。.！!？?；;])'
             r'\s*'
-            r'(?=(?:我)?(?:今天)?(?:写了|码了|码字|写作|在写|完成了|写了稿|更了|读了|看了|阅读|在读|在看|翻看))'
+            r'(?='
+            r'(?:我)?(?:今天)?'
+            r'(?:写了|码了|码字|写作|在写|完成了|写了稿|更了|'
+            r'读了|看了|阅读|在读|在看|翻看)'
+            r')'
         )
         parts = re.split(split_pattern, text)
         parts = [p.strip() for p in parts if p.strip()]
 
-        # 如果拆分后只有一段，说明没有明显分隔，整段返回
         if len(parts) <= 1:
             return [text.strip()]
-
         return parts
 
-    # ──────────── LLM 调用 ────────────
+    # ──────────── LLM 调用（只处理单个活动） ────────────
 
-    async def _call_llm(self, rule_text: str, user_input: str) -> str:
+    async def _call_llm_single(self, rule_text: str, activity_text: str) -> str:
         """
-        将规则 + 用户输入发给 LLM，返回生成的 Markdown。
-        如果 LLM 不可用，自动降级为本地规则匹配。
+        将单个活动的描述发给 LLM，返回生成的 Markdown。
+        LLM 不需要操心时间，也不需要考虑多活动。
         """
-        now = datetime.now().strftime('%H:%M')
         system_prompt = (
             "你是 LifeOS 记录助手。请严格按照下方规则，"
-            "将用户的自然语言描述转换为标准格式。\n\n"
-            "重要规则：\n"
-            "1. 时间统一使用当前系统时间：" + now + "\n"
-            "2. 如果用户一条消息中包含多个活动（如既写了又读了），"
-            "请分别输出多个条目，条目之间用空行隔开。\n"
-            "3. 只输出 Markdown，不要添加任何额外说明、注释或问候语。"
+            "将用户的自然语言描述转换为标准格式。\n"
+            "注意：你只负责处理一个活动的描述。\n"
+            "只输出 Markdown，不要添加任何额外说明。"
         )
 
         user_prompt = (
             f"## 记录规则\n\n"
             f"{rule_text}\n\n"
             f"## 用户输入\n\n"
-            f"{user_input}\n\n"
-            f"请根据上述规则转换。注意：如果包含多个活动，请分别输出。"
+            f"{activity_text}\n\n"
+            f"请根据上述规则转换。"
         )
 
         try:
@@ -114,25 +111,23 @@ class LifeOSPlugin(Star):
         except Exception as e:
             logger.warning(f"LLM 调用失败，降级为本地解析：{e}")
 
-        # 降级：本地解析
-        return self._local_parse_all(user_input)
+        return None  # 降级标志
 
-    # ──────────── 本地解析（支持多活动） ────────────
+    # ──────────── 强制修正时间 ────────────
 
-    def _local_parse_all(self, text: str) -> str:
-        """本地解析：先拆分多活动，再分别解析，最后合并"""
-        activities = self._split_activities(text)
-        entries = []
+    def _force_current_time(self, markdown_text: str) -> str:
+        """
+        将 LLM 返回的 Markdown 中的所有时间行替换为当前系统时间。
+        这是关键修复：LLM 的时间永远是错的，本地强制覆盖。
+        """
         now = datetime.now().strftime('%H:%M')
+        # 替换 "时间：任意内容" → "时间：当前时间"
+        return re.sub(r'时间：.*', f'时间：{now}', markdown_text)
 
-        for activity in activities:
-            entry = self._local_parse_single(activity, now)
-            entries.append(entry)
-
-        return '\n'.join(entries)
+    # ──────────── 本地解析降级（单个活动） ────────────
 
     def _local_parse_single(self, text: str, now: str) -> str:
-        """解析单个活动描述"""
+        """本地解析单个活动描述"""
         writing_kw = ['写了', '码了', '码字', '写作', '在写', '完成了', '写了稿', '更了']
         reading_kw = ['读了', '看了', '阅读', '在读', '在看', '翻看']
 
@@ -144,7 +139,6 @@ class LifeOSPlugin(Star):
         elif is_reading and not is_writing:
             return self._local_reading(text, now)
         elif is_writing and is_reading:
-            # 同时命中，通过字数/章节判断
             if re.search(r'\d+\s*章', text) and not re.search(r'\d+\s*(字|千字|万字)', text):
                 return self._local_reading(text, now)
             return self._local_writing(text, now)
@@ -158,7 +152,6 @@ class LifeOSPlugin(Star):
         lines.append('行为：写')
         lines.append('')
 
-        # 提取时长（小时）
         duration = None
         m = re.search(r'(\d+(?:\.\d+)?)\s*(小时|h)', text)
         if m:
@@ -170,7 +163,6 @@ class LifeOSPlugin(Star):
         if m:
             duration = 0.5
 
-        # 提取字数
         word_count = None
         m = re.search(r'(\d+(?:\.\d+)?)\s*(万字|千字|字)', text)
         if m:
@@ -182,7 +174,6 @@ class LifeOSPlugin(Star):
             else:
                 word_count = int(v)
 
-        # 校验
         if duration is None and word_count is None:
             return ('---ERROR---\n'
                     '写作时长和产出字数不能同时为空，烦请作者大大补充。\n'
@@ -193,7 +184,6 @@ class LifeOSPlugin(Star):
         lines.append(f'产出字数：{word_count}' if word_count is not None else '产出字数：')
         lines.append('')
 
-        # 作品名
         m = re.search(r'《([^》]+)》', text)
         work = m.group(1) if m else ''
         if not work:
@@ -203,7 +193,6 @@ class LifeOSPlugin(Star):
         lines.append(f'产出作品：{work}')
         lines.append('')
 
-        # 写作类型
         m = re.search(r'(正文|随笔|设计)', text)
         wtype = m.group(1) if m else '随笔'
         lines.append(f'写作类型：{wtype}')
@@ -219,7 +208,6 @@ class LifeOSPlugin(Star):
         lines.append('行为：读')
         lines.append('')
 
-        # 阅读时长（小时）
         duration = None
         m = re.search(r'(\d+(?:\.\d+)?)\s*(小时|h)', text)
         if m:
@@ -231,13 +219,11 @@ class LifeOSPlugin(Star):
         if m:
             duration = 0.5
 
-        # 章节
         chapters = None
         m = re.search(r'(\d+(?:\.\d+)?)\s*章', text)
         if m:
             chapters = float(m.group(1))
 
-        # 校验
         if duration is None and chapters is None:
             return ('---ERROR---\n'
                     '阅读时长和阅读章节不能同时为空，烦请读者大大补充。\n'
@@ -248,7 +234,6 @@ class LifeOSPlugin(Star):
         lines.append(f'阅读章节：{chapters}' if chapters is not None else '阅读章节：')
         lines.append('')
 
-        # 作品名
         m = re.search(r'《([^》]+)》', text)
         book = m.group(1) if m else ''
         if not book:
@@ -258,7 +243,6 @@ class LifeOSPlugin(Star):
         lines.append(f'阅读作品：{book}')
         lines.append('')
 
-        # 阅读类型
         m = re.search(r'(精读|随读)', text)
         rtype = m.group(1) if m else '随读'
         lines.append(f'阅读类型：{rtype}')
@@ -296,6 +280,37 @@ class LifeOSPlugin(Star):
         lines.append('——————')
 
         return '\n'.join(lines)
+
+    # ──────────── 核心处理管道 ────────────
+
+    async def _process_activities(self, rule_text: str, raw_input: str) -> str:
+        """
+        处理一条可能包含多个活动的输入：
+        1. 本地拆分活动
+        2. 每个活动逐个处理（优先 LLM → 降级本地）
+        3. 强制覆盖为当前系统时间
+        4. 合并所有条目的 Markdown
+        """
+        now = datetime.now().strftime('%H:%M')
+        activities = self._split_activities(raw_input)
+        all_entries = []
+
+        for activity in activities:
+            # 尝试 LLM（只传单个活动）
+            llm_result = await self._call_llm_single(rule_text, activity)
+
+            if llm_result and '---ERROR---' not in llm_result:
+                # LLM 成功：强制修正时间
+                entry = self._force_current_time(llm_result)
+            else:
+                # LLM 失败或无结果：本地解析
+                entry = self._local_parse_single(activity, now)
+
+            all_entries.append(entry)
+
+        # 合并所有条目
+        combined = '\n'.join(all_entries)
+        return combined
 
     # ──────────── 文件写入 ────────────
 
@@ -340,8 +355,7 @@ class LifeOSPlugin(Star):
     @filter.command("记录")
     async def record(self, event: AstrMessageEvent):
         """
-        记录活动：读取规则 → 调用 LLM/本地解析 → 写入文件
-        支持一条消息中包含多个活动。
+        记录活动：拆分 → 逐条处理（LLM/本地）→ 强制本地时间 → 写入
         """
         message = event.message_str.strip()
         content = message[len("记录"):].strip()
@@ -363,20 +377,22 @@ class LifeOSPlugin(Star):
             yield event.plain_result("⚠️ 规则文件 record_rule.md 未找到，请检查配置。")
             return
 
-        # 2. 调用 LLM（带本地降级）
-        generated = await self._call_llm(rule_text, content)
+        # 2. 核心处理：拆分 → 逐条处理 → 强制本地时间
+        generated = await self._process_activities(rule_text, content)
 
-        # 3. 检查错误返回
+        # 3. 检查错误
         if '---ERROR---' in generated:
-            error_msg = generated.replace('---ERROR---', '').strip()
+            # 提取所有错误信息
+            errors = re.findall(r'---ERROR---\n(.*?)\n---ERROR---', generated, re.DOTALL)
+            error_msg = '\n'.join(e.strip() for e in errors)
             yield event.plain_result(f"⚠️ {error_msg}")
             return
 
         # 4. 写入文件
         file_path = self._write_records(generated)
 
-        # 5. 统计写入的条目数
-        entry_count = generated.count('---') // 2  # 每对 --- ... --- 算一个条目
+        # 5. 统计条目数
+        entry_count = generated.count('---') // 2
 
         yield event.plain_result(
             f"✅ 已记录！共 {entry_count} 条\n"
