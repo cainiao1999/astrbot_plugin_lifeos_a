@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import datetime
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -58,8 +59,8 @@ class LifeOSPlugin(Star):
     @filter.command("记录")
     async def record(self, event: AstrMessageEvent):
         """
-        将输入内容追加写入
-        /root/projects/life-project/Data/mdtest/W1test.md
+        将输入内容追加写入：
+        /data/lifeos/Data/testYYYYMMDD.md
         """
 
         message = event.message_str.strip()
@@ -73,15 +74,22 @@ class LifeOSPlugin(Star):
             )
             return
 
-        data_dir = Path("/root/projects/life-project/Data/mdtest")
+        # LifeOS 数据目录
+        data_dir = Path("/data/lifeos/Data")
         data_dir.mkdir(parents=True, exist_ok=True)
 
-        file_path = data_dir / "W1test.md"
+        # 今日日期，例如：20260706
+        today = datetime.now().strftime("%Y%m%d")
 
+        # 文件名：test20260706.md
+        file_path = data_dir / f"test{today}.md"
+
+        # 追加写入
         with open(file_path, "a", encoding="utf-8") as f:
             f.write(content + "\n")
 
         logger.info(f"LifeOS 已记录：{content}")
+        logger.info(f"写入文件：{file_path}")
 
         yield event.plain_result("✅ 已成功记录。")
 
