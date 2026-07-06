@@ -1,0 +1,20 @@
+{
+  "data_path": {
+    "description": "数据文件存储目录",
+    "type": "string",
+    "default": "/data/lifeos/Data",
+    "hint": "记录文件会以 YYYY-MM-DD.md 的格式保存在此目录下。"
+  },
+  "config_path": {
+    "description": "规则配置文件目录",
+    "type": "string",
+    "default": "/data/lifeos/Config",
+    "hint": "插件首次启动会自动从 rules/ 复制默认规则到此目录。修改后需重载插件生效。"
+  },
+  "llm_provider": {
+    "description": "LLM 提供商（留空则使用 AstrBot 当前默认）",
+    "type": "string",
+    "default": "",
+    "hint": "可选：指定使用的 AI 模型，如 openai/gpt-4o。留空则使用系统默认。"
+  }
+}
