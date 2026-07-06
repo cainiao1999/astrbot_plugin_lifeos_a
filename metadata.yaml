@@ -1,7 +1,7 @@
-name: helloworld # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
-display_name: helloworld第一版 # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
-desc: 以helloworld模板为基础的尝试一 # 插件简短描述
+name: astrbot_plugin_lifeos # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
+display_name: LifeOS第一版 # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
+desc: LifeOS第一版 # 插件简短描述
 version: v1.3.0 # 插件版本号。格式：v1.1.1 或者 v1.1
-author: Soulter # 作者
-short_desc: 一句话介绍我的插件啥也不是现在!
-repo: https://github.com/Soulter/helloworld # 插件的仓库地址
+author: 三本正经 # 作者
+short_desc: 一句话介绍啥也不是现在!
+repo: https://github.com/cainiao1999/astrbot_plugin_lifeos_a.git # 插件的仓库地址
