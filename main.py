@@ -38,28 +38,28 @@ class MyPlugin(Star):
 
     @filter.command_group("math")
     def math():
-    pass
+        pass
 
     @math.group("calc") # 请注意，这里是 group，而不是 command_group
     def calc():
-    pass
+        pass
 
     @calc.command("add")
     async def add(self, event: AstrMessageEvent, a: int, b: int):
-    yield event.plain_result(f"结果是: {a + b}")
+        yield event.plain_result(f"结果是: {a + b}")
 
     @calc.command("sub")
     async def sub(self, event: AstrMessageEvent, a: int, b: int):
-    yield event.plain_result(f"结果是: {a - b}")
+        yield event.plain_result(f"结果是: {a - b}")
 
     @calc.command("help")
     async def calc_help(self, event: AstrMessageEvent):
-    # /math calc help
-    yield event.plain_result("这是一个计算器插件，拥有 add, sub 指令。")
+        # /math calc help
+        yield event.plain_result("这是一个计算器插件，拥有 add, sub 指令。")
     
     @filter.command("help", alias={'帮助', 'helpme'})
     async def help(self, event: AstrMessageEvent):
-    yield event.plain_result("这是一个计算器插件，拥有 add, sub 指令。")
+        yield event.plain_result("这是一个计算器插件，拥有 add, sub 指令。")
     
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
