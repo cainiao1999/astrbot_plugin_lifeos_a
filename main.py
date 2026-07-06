@@ -22,8 +22,12 @@ class MyPlugin(Star):
     # 注册一个 test 指令
     @filter.command("test")
     async def test(self, event: AstrMessageEvent):
-        """测试指令"""
-        yield event.plain_result("大作家,你成功的test了!")    
+        """这是一个测试指令"""
+        user_name = event.get_sender_name()
+        message_str = event.message_str # 用户发的纯文本消息字符串
+        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
+        logger.info(message_chain)
+        yield event.plain_result("Hello大作家,你成功的test! {user_name}, 你发了 {message_str}!")    
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
