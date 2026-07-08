@@ -16,15 +16,15 @@ LifeOS 是一个 AstrBot 插件。
 
 ```
 astrbot_plugin_lifeos/
-
+LifeOS
 │
-├── main.py                 # AstrBot 插件入口（尽量保持精简）
+├── main.py          ← 插件入口、消息识别、消息分发（以后几乎只增不改）
 │
-├── parser.py               # 记录解析（LLM + 本地降级）
+├── bootstrap.py         ← 初始化、配置、规则文件管理（以后基本不再修改）
 │
-├── storage.py              # Markdown / SQLite 写入
+├── 写入部分.py       ← 所有"写"相关逻辑（以后主要修改这里）
 │
-├── utils.py                # 通用工具函数
+├── 读取部分.py       ← 所有"读"相关逻辑（以后主要修改这里）
 │
 ├── rules/
 │   └── record_rule.md
