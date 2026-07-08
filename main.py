@@ -573,6 +573,86 @@ class LifeOSPlugin(Star):
         logger.info(f'LifeOS 写入数据库：{count} 条')
         return count
 
+    # ──────────── 记录回复格式化 ────────────
+
+    def _format_record_response(self, records: list) -> str:
+        """格式化记录成功回复：新增内容 + 今日总计"""
+        today_str = datetime.now().strftime('%Y-%m-%d')
+
+        new_items = []
+        for record in records:
+            if record is None:
+                continue
+            table = record['db_table']
+            work_name = record.get('work_name', '')
+            record_type = record.get('record_type', '')
+            output_count = record.get('output_count')
+            duration = record.get('duration')
+
+            prefix = f'《{work_name}》' if work_name else ''
+            prefix += record_type if record_type else ''
+
+            if table == 'writing_records':
+                if output_count:
+                    s = f'{prefix}新增{output_count}字'
+                    if duration:
+                        s += f'，耗时{duration:.2f}小时'
+                elif duration:
+                    s = f'{prefix}新增写作{duration:.2f}小时'
+                else:
+                    s = f'{prefix}已记录'
+                new_items.append(s)
+            elif table == 'reading_records':
+                if output_count:
+                    s = f'{prefix}新增{output_count}章'
+                    if duration:
+                        s += f'，耗时{duration:.2f}小时'
+                elif duration:
+                    s = f'{prefix}新增阅读{duration:.2f}小时'
+                else:
+                    s = f'{prefix}已记录'
+                new_items.append(s)
+
+        result = '已成功记录，' + '，'.join(new_items) if new_items else '已成功记录'
+
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT COALESCE(SUM(duration), 0), COALESCE(SUM(output_count), 0) FROM writing_records WHERE record_date = ?",
+            (today_str,)
+        )
+        w_dur, w_out = cursor.fetchone()
+
+        cursor.execute(
+            "SELECT COALESCE(SUM(duration), 0), COALESCE(SUM(output_count), 0) FROM reading_records WHERE record_date = ?",
+            (today_str,)
+        )
+        r_dur, r_out = cursor.fetchone()
+        conn.close()
+
+        today_parts = []
+        if w_out > 0 or w_dur > 0:
+            wp = []
+            if w_out > 0:
+                wp.append(f'{int(w_out)}个字')
+            if w_dur > 0:
+                wp.append(f'{w_dur:.2f}个小时')
+            today_parts.append(f'您今日共写了{"，".join(wp)}')
+
+        if r_out > 0 or r_dur > 0:
+            rp = []
+            if r_out > 0:
+                rp.append(f'{int(r_out)}章')
+            if r_dur > 0:
+                rp.append(f'{r_dur:.2f}个小时')
+            today_parts.append(f'您今日共读了{"，".join(rp)}')
+
+        if today_parts:
+            result += '！' + '！'.join(today_parts) + '！'
+
+        return result
+
     # ──────────── 文件写入 ────────────
 
     def _write_records(self, entries: list, methods: list, raw_texts: list) -> Path:
@@ -714,12 +794,7 @@ class LifeOSPlugin(Star):
         db_count = self._write_to_db(all_records)
         file_path = self._write_records(all_md, ['LLM'] * len(all_md), [raw_text] * len(all_md))
 
-        yield event.plain_result(
-            f"✅ 已记录！共 {len(all_md)} 条\n"
-            f"💾 数据库写入 {db_count} 条\n"
-            f"🔧 LLM 解析\n"
-            f"📂 {file_path}"
-        )
+        yield event.plain_result(self._format_record_response(all_records))
 
     # ──────────── 查询功能 ────────────
 
@@ -1316,11 +1391,7 @@ class LifeOSPlugin(Star):
             raw_texts = [r[2] for r in local_results]
             self._write_records(entries, ['本地'] * len(entries), raw_texts)
             db_count = self._write_to_db(records_list)
-            yield event.plain_result(
-                f"✅ 已记录！共 {len(entries)} 条\n"
-                f"💾 数据库写入 {db_count} 条\n"
-                f"🔧 本地解析"
-            )
+            yield event.plain_result(self._format_record_response(records_list))
             return
 
         # 3. 有歧义 → LLM 路径
@@ -1335,10 +1406,7 @@ class LifeOSPlugin(Star):
                 raw_texts = [r[2] for r in local_results]
                 self._write_records(entries, ['本地(兜底)'] * len(entries), raw_texts)
                 db_count = self._write_to_db(records_list)
-                yield event.plain_result(
-                    f"✅ 已记录！（LLM 不可用，本地兜底）\n"
-                    f"💾 数据库写入 {db_count} 条"
-                )
+                yield event.plain_result(self._format_record_response(records_list))
                 return
             yield event.plain_result("⚠️ LLM 不可用且无法本地解析，请尝试更简洁的表述。")
             return
