@@ -163,7 +163,7 @@ class LifeOSPlugin(Star):
             duration = fields.get('写作时长', '')
             output_count = fields.get('产出字数', '')
             return {
-                'db_table': 'writing',
+                'db_table': 'writing_records',
                 'record_date': record_date,
                 'record_time': fields.get('时间', ''),
                 'duration': float(duration) if duration else None,
@@ -177,7 +177,7 @@ class LifeOSPlugin(Star):
             duration = fields.get('阅读时长', '')
             output_count = fields.get('阅读章节', '')
             return {
-                'db_table': 'reading',
+                'db_table': 'reading_records',
                 'record_date': record_date,
                 'record_time': fields.get('时间', ''),
                 'duration': float(duration) if duration else None,
@@ -297,7 +297,7 @@ class LifeOSPlugin(Star):
         lines.append('——————')
 
         record = {
-            'db_table': 'writing',
+            'db_table': 'writing_records',
             'record_date': today,
             'record_time': now,
             'duration': duration,
@@ -384,7 +384,7 @@ class LifeOSPlugin(Star):
         lines.append('——————')
 
         record = {
-            'db_table': 'reading',
+            'db_table': 'reading_records',
             'record_date': today,
             'record_time': now,
             'duration': duration,
