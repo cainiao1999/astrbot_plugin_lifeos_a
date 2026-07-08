@@ -755,7 +755,8 @@ class LifeOSPlugin(Star):
             yield event.plain_result("⚠️ LLM 不可用，请重新发起 /记录。")
             return
 
-        await self._handle_llm_record_output(event, user_id, reply, llm_output)
+        async for result in self._handle_llm_record_output(event, user_id, reply, llm_output):
+            yield result
 
     async def _handle_llm_record_output(self, event: AstrMessageEvent, user_id: str,
                                           raw_text: str, llm_output: str):
@@ -938,20 +939,17 @@ class LifeOSPlugin(Star):
         r_dur = r_total[0] or 0 if r_total else 0
         r_out = r_total[1] or 0 if r_total else 0
 
-        read_parts = []
-        if r_dur > 0:
-            read_parts.append(f'阅读了{r_dur:.2f}小时')
+        read_str = ''
         if r_out > 0:
-            read_parts.append(f'看了{int(r_out)}章')
+            read_str = f'共阅读了{int(r_out)}章'
+        elif r_dur > 0:
+            read_str = f'共阅读了{r_dur:.2f}小时'
 
-        write_parts = []
-        if w_dur > 0:
-            write_parts.append(f'写了{w_dur:.2f}小时')
+        write_str = ''
         if w_out > 0:
-            write_parts.append(f'{int(w_out)}字')
-
-        read_str = ''.join(read_parts)
-        write_str = ''.join(write_parts)
+            write_str = f'共写下了{int(w_out)}字'
+        elif w_dur > 0:
+            write_str = f'共写了{w_dur:.2f}小时'
 
         if read_str and write_str:
             return f'{prefix}你{read_str}，{write_str}。'
