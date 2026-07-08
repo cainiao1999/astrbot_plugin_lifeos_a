@@ -793,8 +793,8 @@ class LifeOSPlugin(Star):
             params = [(today - timedelta(days=29)).strftime('%Y-%m-%d')]
             days_col = 'COUNT(DISTINCT record_date)'
 
-        sql_w_detail = f"SELECT work_name, GROUP_CONCAT(DISTINCT record_type, '、'), SUM(duration), SUM(output_count), {days_col} FROM writing_records {date_cond} GROUP BY work_name"
-        sql_r_detail = f"SELECT work_name, GROUP_CONCAT(DISTINCT record_type, '、'), SUM(duration), SUM(output_count), {days_col} FROM reading_records {date_cond} GROUP BY work_name"
+        sql_w_detail = f"SELECT work_name, GROUP_CONCAT(DISTINCT record_type), SUM(duration), SUM(output_count), {days_col} FROM writing_records {date_cond} GROUP BY work_name"
+        sql_r_detail = f"SELECT work_name, GROUP_CONCAT(DISTINCT record_type), SUM(duration), SUM(output_count), {days_col} FROM reading_records {date_cond} GROUP BY work_name"
         sql_w_total = f"SELECT SUM(duration), SUM(output_count) FROM writing_records {date_cond}"
         sql_r_total = f"SELECT SUM(duration), SUM(output_count) FROM reading_records {date_cond}"
 
