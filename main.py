@@ -2,6 +2,7 @@ from pathlib import Path
 from datetime import datetime
 import shutil
 import re
+import sqlite3
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -20,15 +21,18 @@ class LifeOSPlugin(Star):
         self.config = config or {}
         self.data_path = Path(self.config.get('data_path', '/data/lifeos/Data'))
         self.config_path = Path(self.config.get('config_path', '/data/lifeos/Config'))
+        self.db_path = Path(self.config.get('db_path', '/data/lifeos/Database/lifeos.db'))
 
     async def initialize(self):
         """插件初始化：创建目录结构，复制默认规则"""
         self.data_path.mkdir(parents=True, exist_ok=True)
         self.config_path.mkdir(parents=True, exist_ok=True)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_rule_files()
         logger.info(f"LifeOS 初始化完成")
         logger.info(f"  数据目录：{self.data_path}")
         logger.info(f"  配置目录：{self.config_path}")
+        logger.info(f"  数据库：{self.db_path}")
 
     # ──────────── 规则文件管理 ────────────
 
@@ -134,10 +138,63 @@ class LifeOSPlugin(Star):
         now = datetime.now().strftime('%H:%M')
         return re.sub(r'时间：.*', f'时间：{now}', markdown_text)
 
+    # ──────────── 从 Markdown 提取结构化字段（LLM 路径用） ────────────
+
+    def _extract_record_from_markdown(self, markdown: str, record_date: str):
+        """
+        从 LLM 生成的 Markdown 中提取结构化字段，用于写入数据库。
+        返回 None 表示该记录不需要写入 DB（ERROR 或 其他 类型）。
+        """
+        if '---ERROR---' in markdown:
+            return None
+
+        fields = {}
+        for line in markdown.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            if '：' in line:
+                key, _, value = line.partition('：')
+                fields[key.strip()] = value.strip()
+
+        behavior = fields.get('行为', '')
+
+        if behavior == '写':
+            duration = fields.get('写作时长', '')
+            output_count = fields.get('产出字数', '')
+            return {
+                'db_table': 'writing',
+                'record_date': record_date,
+                'record_time': fields.get('时间', ''),
+                'duration': float(duration) if duration else None,
+                'output_count': int(output_count) if output_count else None,
+                'work_name': fields.get('产出作品', ''),
+                'record_type': fields.get('写作类型', '随笔'),
+                'remark': '',
+                'source': 'qq',
+            }
+        elif behavior == '读':
+            duration = fields.get('阅读时长', '')
+            output_count = fields.get('阅读章节', '')
+            return {
+                'db_table': 'reading',
+                'record_date': record_date,
+                'record_time': fields.get('时间', ''),
+                'duration': float(duration) if duration else None,
+                'output_count': int(float(output_count)) if output_count else None,
+                'work_name': fields.get('阅读作品', ''),
+                'record_type': fields.get('阅读类型', '随读'),
+                'remark': '',
+                'source': 'qq',
+            }
+        else:
+            # "其他" 类型不写入 DB
+            return None
+
     # ──────────── 本地解析降级（单个活动） ────────────
 
-    def _local_parse_single(self, text: str, now: str) -> str:
-        """本地解析单个活动描述"""
+    def _local_parse_single(self, text: str, now: str, today: str) -> tuple:
+        """本地解析单个活动描述，返回 (markdown, record_dict)"""
         writing_kw = ['写了', '码了', '码字', '写作', '在写', '完成了', '写了稿', '更了']
         reading_kw = ['读了', '看了', '阅读', '在读', '在看', '翻看']
 
@@ -145,17 +202,17 @@ class LifeOSPlugin(Star):
         is_reading = any(kw in text for kw in reading_kw)
 
         if is_writing and not is_reading:
-            return self._local_writing(text, now)
+            return self._local_writing(text, now, today)
         elif is_reading and not is_writing:
-            return self._local_reading(text, now)
+            return self._local_reading(text, now, today)
         elif is_writing and is_reading:
             if re.search(r'\d+\s*章', text) and not re.search(r'\d+\s*(字|千字|万字)', text):
-                return self._local_reading(text, now)
-            return self._local_writing(text, now)
+                return self._local_reading(text, now, today)
+            return self._local_writing(text, now, today)
         else:
             return self._local_other(text, now)
 
-    def _local_writing(self, text: str, now: str) -> str:
+    def _local_writing(self, text: str, now: str, today: str) -> tuple:
         lines = ['---']
         lines.append(f'时间：{now}')
         lines.append('')
@@ -211,35 +268,49 @@ class LifeOSPlugin(Star):
             else:
                 word_count = int(v)
 
-        # 校验
-        if duration is None and word_count is None:
-            return ('---ERROR---\n'
-                    '写作时长和产出字数不能同时为空，烦请作者大大补充。\n'
-                    '---ERROR---')
-
-        lines.append(f'写作时长：{duration}' if duration is not None else '写作时长：')
-        lines.append('')
-        lines.append(f'产出字数：{word_count}' if word_count is not None else '产出字数：')
-        lines.append('')
-
+        # ---- 提取作品名 ----
         m = re.search(r'《([^》]+)》', text)
         work = m.group(1) if m else ''
         if not work:
             m = re.search(r'"([^"]+)"', text)
             if m:
                 work = m.group(1)
-        lines.append(f'产出作品：{work}')
-        lines.append('')
 
+        # ---- 提取写作类型 ----
         m = re.search(r'(正文|随笔|设计)', text)
         wtype = m.group(1) if m else '随笔'
+
+        # 校验
+        if duration is None and word_count is None:
+            return ('---ERROR---\n'
+                    '写作时长和产出字数不能同时为空，烦请作者大大补充。\n'
+                    '---ERROR---', None)
+
+        lines.append(f'写作时长：{duration}' if duration is not None else '写作时长：')
+        lines.append('')
+        lines.append(f'产出字数：{word_count}' if word_count is not None else '产出字数：')
+        lines.append('')
+        lines.append(f'产出作品：{work}')
+        lines.append('')
         lines.append(f'写作类型：{wtype}')
         lines.append('')
         lines.append('——————')
 
-        return '\n'.join(lines)
+        record = {
+            'db_table': 'writing',
+            'record_date': today,
+            'record_time': now,
+            'duration': duration,
+            'output_count': word_count,
+            'work_name': work,
+            'record_type': wtype,
+            'remark': '',
+            'source': 'qq',
+        }
 
-    def _local_reading(self, text: str, now: str) -> str:
+        return ('\n'.join(lines), record)
+
+    def _local_reading(self, text: str, now: str, today: str) -> tuple:
         lines = ['---']
         lines.append(f'时间：{now}')
         lines.append('')
@@ -283,14 +354,14 @@ class LifeOSPlugin(Star):
 
         # ---- 章节 ----
         chapters = None
-        m = re.search(r'(\d+(?:\.\d+)?)\s*章', text)
+        m = re.search(r'(\d+)\s*章', text)
         if m:
-            chapters = float(m.group(1))
+            chapters = int(m.group(1))
 
         if duration is None and chapters is None:
             return ('---ERROR---\n'
                     '阅读时长和阅读章节不能同时为空，烦请读者大大补充。\n'
-                    '---ERROR---')
+                    '---ERROR---', None)
 
         lines.append(f'阅读时长：{duration}' if duration is not None else '阅读时长：')
         lines.append('')
@@ -312,9 +383,21 @@ class LifeOSPlugin(Star):
         lines.append('')
         lines.append('——————')
 
-        return '\n'.join(lines)
+        record = {
+            'db_table': 'reading',
+            'record_date': today,
+            'record_time': now,
+            'duration': duration,
+            'output_count': chapters,
+            'work_name': book,
+            'record_type': rtype,
+            'remark': '',
+            'source': 'qq',
+        }
 
-    def _local_other(self, text: str, now: str) -> str:
+        return ('\n'.join(lines), record)
+
+    def _local_other(self, text: str, now: str) -> tuple:
         lines = ['---']
         lines.append(f'时间：{now}')
         lines.append('')
@@ -368,53 +451,84 @@ class LifeOSPlugin(Star):
         lines.append('')
         lines.append('——————')
 
-        return '\n'.join(lines)
+        return ('\n'.join(lines), None)
 
     # ──────────── 核心处理管道 ────────────
 
     async def _process_activities(self, event: AstrMessageEvent, rule_text: str, raw_input: str) -> tuple:
         """
         处理一条可能包含多个活动的输入。
-        返回: (合并后的Markdown, 各活动的处理方式列表)
+        返回: (entries列表, methods列表, records列表, raw_texts列表)
         """
         now = datetime.now().strftime('%H:%M')
+        today = datetime.now().strftime('%Y-%m-%d')
         activities = self._split_activities(raw_input)
         all_entries = []
         methods = []
+        records = []
 
-        for i, activity in enumerate(activities):
-            # 尝试 LLM（传 event 用于获取 provider_id）
+        for activity in activities:
             llm_result = await self._call_llm_single(event, rule_text, activity)
 
             if llm_result and '---ERROR---' not in llm_result:
                 entry = self._force_current_time(llm_result)
                 methods.append('LLM')
+                record = self._extract_record_from_markdown(entry, today)
             else:
-                entry = self._local_parse_single(activity, now)
+                entry, record = self._local_parse_single(activity, now, today)
                 if llm_result is None:
                     methods.append('本地(LLM不可用)')
                 else:
                     methods.append('本地(LLM返回异常)')
 
             all_entries.append(entry)
+            records.append(record)
 
-        combined = '\n'.join(all_entries)
-        return combined, methods
+        return all_entries, methods, records, activities
+
+    # ──────────── 数据库写入 ────────────
+
+    def _write_to_db(self, records: list) -> int:
+        """将结构化记录写入 SQLite。跳过 None。返回实际写入条数。"""
+        count = 0
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+
+        for record in records:
+            if record is None:
+                continue
+            table = record['db_table']
+            columns = {k: v for k, v in record.items() if k != 'db_table'}
+            names = ', '.join(columns.keys())
+            placeholders = ', '.join(['?' for _ in columns])
+            sql = f'INSERT INTO {table} ({names}) VALUES ({placeholders})'
+            cursor.execute(sql, list(columns.values()))
+            count += 1
+
+        conn.commit()
+        conn.close()
+        logger.info(f'LifeOS 写入数据库：{count} 条')
+        return count
 
     # ──────────── 文件写入 ────────────
 
-    def _write_records(self, markdown_text: str) -> Path:
-        """将 Markdown 条目追加到当日数据文件"""
+    def _write_records(self, entries: list, methods: list, raw_texts: list) -> Path:
+        """将记录以增强日志格式追加到当日文件"""
         today = datetime.now().strftime('%Y-%m-%d')
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         file_path = self.data_path / f'{today}.md'
 
         is_new = not file_path.exists()
         with open(file_path, 'a', encoding='utf-8') as f:
             if is_new:
                 f.write(f'# {today}\n\n')
-            f.write(markdown_text.strip() + '\n\n')
 
-        logger.info(f'LifeOS 写入记录：{file_path}')
+            for i, (entry, method, raw) in enumerate(zip(entries, methods, raw_texts), 1):
+                f.write(f'### [{timestamp}] 记录 #{i} [{method}]\n')
+                f.write(f'> 原始输入：{raw}\n\n')
+                f.write(entry.strip() + '\n\n')
+
+        logger.info(f'LifeOS 写入日志：{file_path}')
         return file_path
 
     # ──────────── 命令入口 ────────────
@@ -444,7 +558,7 @@ class LifeOSPlugin(Star):
     @filter.command("记录")
     async def record(self, event: AstrMessageEvent):
         """
-        记录活动：拆分 → 逐条处理（LLM/本地）→ 强制本地时间 → 写入
+        记录活动：拆分 → 逐条处理（LLM/本地）→ 写入 DB + 日志
         """
         message = event.message_str.strip()
         content = message[len("记录"):].strip()
@@ -466,27 +580,29 @@ class LifeOSPlugin(Star):
             yield event.plain_result("⚠️ 规则文件 record_rule.md 未找到，请检查配置。")
             return
 
-        # 2. 核心处理（传入 event）
-        generated, methods = await self._process_activities(event, rule_text, content)
+        # 2. 核心处理
+        entries, methods, records, raw_texts = await self._process_activities(event, rule_text, content)
 
         # 3. 检查错误
+        generated = '\n'.join(entries)
         if '---ERROR---' in generated:
             errors = re.findall(r'---ERROR---\n(.*?)\n---ERROR---', generated, re.DOTALL)
             error_msg = '\n'.join(e.strip() for e in errors)
             yield event.plain_result(f"⚠️ {error_msg}")
             return
 
-        # 4. 写入文件
-        file_path = self._write_records(generated)
+        # 4. 写入数据库
+        db_count = self._write_to_db(records)
 
-        # 5. 统计条目数
-        entry_count = generated.count('---') // 2
+        # 5. 写入日志文件
+        file_path = self._write_records(entries, methods, raw_texts)
 
-        # 6. 拼接处理方式说明
+        # 6. 统计与回复
         method_info = ' | '.join([f'活动{i+1}: {m}' for i, m in enumerate(methods)])
 
         yield event.plain_result(
-            f"✅ 已记录！共 {entry_count} 条\n"
+            f"✅ 已记录！共 {len(entries)} 条\n"
+            f"💾 数据库写入 {db_count} 条\n"
             f"🔧 {method_info}\n"
             f"📂 {file_path}"
         )
