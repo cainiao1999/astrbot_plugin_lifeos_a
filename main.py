@@ -22,6 +22,7 @@ class LifeOSPlugin(Star):
         self.data_path = Path(self.config.get('data_path', '/data/lifeos/Data'))
         self.config_path = Path(self.config.get('config_path', '/data/lifeos/Config'))
         self.db_path = Path(self.config.get('db_path', '/data/lifeos/Database/lifeos.db'))
+        self.pending = {}  # {user_id: {'original': str, 'question': str, 'timestamp': datetime}}
 
     async def initialize(self):
         """插件初始化：创建目录结构，复制默认规则"""
@@ -276,8 +277,9 @@ class LifeOSPlugin(Star):
             if m:
                 work = m.group(1)
 
-        # ---- 提取写作类型 ----
-        m = re.search(r'(正文|随笔|设计)', text)
+        # ---- 提取写作类型（排除《》内的词） ----
+        text_no_book = re.sub(r'《[^》]+》', '', text)
+        m = re.search(r'(正文|随笔|设计|设定|大纲)', text_no_book)
         wtype = m.group(1) if m else '随笔'
 
         # 校验
@@ -453,6 +455,67 @@ class LifeOSPlugin(Star):
 
         return ('\n'.join(lines), None)
 
+    # ──────────── 完美匹配检查 ────────────
+
+    def _try_perfect_match(self, text: str, now: str, today: str):
+        """
+        尝试本地完美匹配。成功返回 (markdown, dict)，有歧义返回 None。
+        歧义条件：类型关键词冲突、作品名与 DB 中已有记录模糊匹配。
+        """
+        writing_kw = ['写了', '码了', '码字', '写作', '在写', '完成了', '写了稿', '更了']
+        reading_kw = ['读了', '看了', '阅读', '在读', '在看', '翻看']
+
+        is_writing = any(kw in text for kw in writing_kw)
+        is_reading = any(kw in text for kw in reading_kw)
+
+        if not is_writing and not is_reading:
+            return self._local_other(text, now)
+
+        # 检查类型关键词冲突（排除书名号内的词）
+        text_no_book = re.sub(r'《[^》]+》', '', text)
+        writing_types = ['正文', '随笔', '设计', '设定', '大纲']
+        reading_types = ['精读', '随读']
+
+        found_wt = [t for t in writing_types if t in text_no_book]
+        found_rt = [t for t in reading_types if t in text_no_book]
+
+        if len(found_wt) > 1:
+            return None  # 多个写作类型关键词
+        if len(found_rt) > 1:
+            return None  # 多个阅读类型关键词
+
+        # 检查作品名歧义（与 DB 中已有作品模糊匹配）
+        mentioned = re.findall(r'《([^》]+)》', text)
+        for work in mentioned:
+            if self._find_similar_works(work):
+                return None  # 存在相似作品名
+
+        # 通过检查，本地解析
+        if is_writing and is_reading:
+            if re.search(r'\d+\s*章', text) and not re.search(r'\d+\s*(字|千字|万字)', text):
+                return self._local_reading(text, now, today)
+            return self._local_writing(text, now, today)
+        elif is_writing:
+            return self._local_writing(text, now, today)
+        else:
+            return self._local_reading(text, now, today)
+
+    def _find_similar_works(self, work_name: str) -> list:
+        """在 DB 中查找与给定名称相似但不完全相同的作品名。"""
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        similar = []
+        for table in ['writing_records', 'reading_records']:
+            cursor.execute(
+                f"SELECT DISTINCT work_name FROM {table} WHERE work_name LIKE ? AND work_name != ?",
+                (f'%{work_name}%', work_name)
+            )
+            for row in cursor.fetchall():
+                if row[0] and row[0] not in similar:
+                    similar.append(row[0])
+        conn.close()
+        return similar
+
     # ──────────── 核心处理管道 ────────────
 
     async def _process_activities(self, event: AstrMessageEvent, rule_text: str, raw_input: str) -> tuple:
@@ -530,6 +593,133 @@ class LifeOSPlugin(Star):
 
         logger.info(f'LifeOS 写入日志：{file_path}')
         return file_path
+
+    # ──────────── LLM 记录辅助 ────────────
+
+    async def _call_llm_for_record(self, event: AstrMessageEvent, rule_text: str, content: str,
+                                     similar_works: str = '') -> str:
+        """LLM 优先的记录调用。返回 LLM 输出文本或 None。"""
+        system_prompt = (
+            "你是 LifeOS 记录助手。请严格按照下方规则处理用户输入。\n"
+            "如果信息有歧义，输出 QUESTION 格式询问用户。\n"
+            "只输出记录条目、QUESTION 或 ERROR，不要添加额外说明。"
+        )
+
+        user_prompt = f"## 记录规则\n\n{rule_text}\n\n"
+        if similar_works:
+            user_prompt += f"## 已有相似作品\n\n{similar_works}\n\n"
+        user_prompt += f"## 用户输入\n\n{content}\n\n请根据规则处理。"
+
+        try:
+            umo = event.unified_msg_origin
+            provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+            if not provider_id:
+                return None
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=f"{system_prompt}\n\n{user_prompt}",
+            )
+            if llm_resp and hasattr(llm_resp, 'completion_text') and llm_resp.completion_text.strip():
+                return llm_resp.completion_text.strip()
+        except Exception as e:
+            logger.warning(f"LLM 记录调用失败：{e}")
+        return None
+
+    def _cleanup_pending(self):
+        """清理超过 10 分钟的待确认记录"""
+        now = datetime.now()
+        stale = [uid for uid, v in self.pending.items()
+                 if (now - v['timestamp']).total_seconds() > 600]
+        for uid in stale:
+            del self.pending[uid]
+
+    def _get_similar_works_context(self, text: str) -> str:
+        """获取与用户输入中作品名相似的已有作品列表，格式化为 LLM 上下文。"""
+        mentioned = re.findall(r'《([^》]+)》', text)
+        if not mentioned:
+            return ''
+        all_similar = []
+        for work in mentioned:
+            sim = self._find_similar_works(work)
+            for s in sim:
+                if s not in all_similar:
+                    all_similar.append(s)
+        if not all_similar:
+            return ''
+        return '已记录过的相似作品：\n' + '\n'.join(f'- {s}' for s in all_similar)
+
+    async def _process_confirmation(self, event: AstrMessageEvent, user_id: str, reply: str):
+        """处理用户对 LLM 追问的确认回复。返回 MessageEventResult 或 None。"""
+        pending = self.pending.pop(user_id)
+        rule_text = self._read_rule('record_rule.md')
+        if not rule_text:
+            yield event.plain_result("⚠️ 规则文件未找到。")
+            return
+
+        user_prompt = (
+            f"## 记录规则\n\n{rule_text}\n\n"
+            f"## 对话历史\n\n"
+            f"助手：{pending['question']}\n"
+            f"用户：{reply}\n\n"
+            f"如果信息已明确，生成记录条目。如果仍有歧义，输出 QUESTION。"
+        )
+
+        system_prompt = (
+            "你是 LifeOS 记录助手。根据用户的澄清回复，如果信息明确则生成记录，"
+            "仍有歧义则输出 QUESTION。只输出记录或 QUESTION，不要额外说明。"
+        )
+
+        llm_output = await self._call_llm_for_query(event, system_prompt, user_prompt)
+
+        if not llm_output:
+            yield event.plain_result("⚠️ LLM 不可用，请重新发起 /记录。")
+            return
+
+        await self._handle_llm_record_output(event, user_id, reply, llm_output)
+
+    async def _handle_llm_record_output(self, event: AstrMessageEvent, user_id: str,
+                                          raw_text: str, llm_output: str):
+        """统一处理 LLM 记录输出：QUESTION → 待确认，记录 → 写入，ERROR → 提示"""
+        q_match = re.search(r'---QUESTION---\n(.*?)\n---QUESTION---', llm_output, re.DOTALL)
+        if q_match:
+            self.pending[user_id] = {
+                'original': raw_text,
+                'question': q_match.group(1).strip(),
+                'timestamp': datetime.now(),
+            }
+            yield event.plain_result(f'🤔 {q_match.group(1).strip()}')
+            return
+
+        if '---ERROR---' in llm_output:
+            errors = re.findall(r'---ERROR---\n(.*?)\n---ERROR---', llm_output, re.DOTALL)
+            error_msg = '\n'.join(e.strip() for e in errors)
+            yield event.plain_result(f"⚠️ {error_msg}")
+            return
+
+        # 有效记录：修正时间、提取字段、写入
+        now = datetime.now().strftime('%H:%M')
+        today = datetime.now().strftime('%Y-%m-%d')
+        llm_output = self._force_current_time(llm_output)
+
+        # 按 —————— 拆分多条记录
+        entries = [e.strip() for e in re.split(r'——————', llm_output) if e.strip()]
+        all_md = []
+        all_records = []
+        for entry in entries:
+            full_entry = entry.strip() + '\n——————'
+            all_md.append(full_entry)
+            record = self._extract_record_from_markdown(full_entry, today)
+            all_records.append(record)
+
+        db_count = self._write_to_db(all_records)
+        file_path = self._write_records(all_md, ['LLM'] * len(all_md), [raw_text] * len(all_md))
+
+        yield event.plain_result(
+            f"✅ 已记录！共 {len(all_md)} 条\n"
+            f"💾 数据库写入 {db_count} 条\n"
+            f"🔧 LLM 解析\n"
+            f"📂 {file_path}"
+        )
 
     # ──────────── 查询功能 ────────────
 
@@ -1050,13 +1240,32 @@ class LifeOSPlugin(Star):
             f"输入：{message_str}"
         )
 
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_message(self, event: AstrMessageEvent):
+        """拦截非命令消息，处理待确认的记录"""
+        message = event.message_str.strip()
+
+        cmd_prefixes = ('记录', '查询', 'query', 'helloworld', 'hello', 'hi',
+                        '测试', 't', 'test', '/')
+        if any(message.startswith(p) for p in cmd_prefixes):
+            return
+
+        user_key = event.unified_msg_origin
+        self._cleanup_pending()
+
+        if user_key not in self.pending:
+            return
+
+        await self._process_confirmation(event, user_key, message)
+
     @filter.command("记录")
     async def record(self, event: AstrMessageEvent):
         """
-        记录活动：拆分 → 逐条处理（LLM/本地）→ 写入 DB + 日志
+        记录活动：完美匹配走本地 → 歧义走 LLM（含追问确认）
         """
         message = event.message_str.strip()
         content = message[len("记录"):].strip()
+        user_key = event.unified_msg_origin
 
         if not content:
             yield event.plain_result(
@@ -1069,38 +1278,72 @@ class LifeOSPlugin(Star):
             )
             return
 
-        # 1. 读取规则文件
+        self._cleanup_pending()
+
+        # 有待确认记录 → 视为对追问的回复
+        if user_key in self.pending:
+            await self._process_confirmation(event, user_key, content)
+            return
+
         rule_text = self._read_rule('record_rule.md')
         if not rule_text:
             yield event.plain_result("⚠️ 规则文件 record_rule.md 未找到，请检查配置。")
             return
 
-        # 2. 核心处理
-        entries, methods, records, raw_texts = await self._process_activities(event, rule_text, content)
+        now = datetime.now().strftime('%H:%M')
+        today = datetime.now().strftime('%Y-%m-%d')
 
-        # 3. 检查错误
-        generated = '\n'.join(entries)
-        if '---ERROR---' in generated:
-            errors = re.findall(r'---ERROR---\n(.*?)\n---ERROR---', generated, re.DOTALL)
-            error_msg = '\n'.join(e.strip() for e in errors)
-            yield event.plain_result(f"⚠️ {error_msg}")
+        # 1. 拆分活动
+        activities = self._split_activities(content)
+
+        # 2. 尝试本地完美匹配
+        all_clear = True
+        local_results = []
+        for activity in activities:
+            result = self._try_perfect_match(activity, now, today)
+            if result is None:
+                all_clear = False
+                break
+            md, record = result
+            if '---ERROR---' in md:
+                all_clear = False
+                break
+            local_results.append((md, record, activity))
+
+        if all_clear and local_results:
+            entries = [r[0] for r in local_results]
+            records_list = [r[1] for r in local_results]
+            raw_texts = [r[2] for r in local_results]
+            self._write_records(entries, ['本地'] * len(entries), raw_texts)
+            db_count = self._write_to_db(records_list)
+            yield event.plain_result(
+                f"✅ 已记录！共 {len(entries)} 条\n"
+                f"💾 数据库写入 {db_count} 条\n"
+                f"🔧 本地解析"
+            )
             return
 
-        # 4. 写入数据库
-        db_count = self._write_to_db(records)
+        # 3. 有歧义 → LLM 路径
+        similar_works = self._get_similar_works_context(content)
+        llm_output = await self._call_llm_for_record(event, rule_text, content, similar_works)
 
-        # 5. 写入日志文件
-        file_path = self._write_records(entries, methods, raw_texts)
+        if not llm_output:
+            # LLM 不可用，尝试本地兜底
+            if local_results:
+                entries = [r[0] for r in local_results]
+                records_list = [r[1] for r in local_results]
+                raw_texts = [r[2] for r in local_results]
+                self._write_records(entries, ['本地(兜底)'] * len(entries), raw_texts)
+                db_count = self._write_to_db(records_list)
+                yield event.plain_result(
+                    f"✅ 已记录！（LLM 不可用，本地兜底）\n"
+                    f"💾 数据库写入 {db_count} 条"
+                )
+                return
+            yield event.plain_result("⚠️ LLM 不可用且无法本地解析，请尝试更简洁的表述。")
+            return
 
-        # 6. 统计与回复
-        method_info = ' | '.join([f'活动{i+1}: {m}' for i, m in enumerate(methods)])
-
-        yield event.plain_result(
-            f"✅ 已记录！共 {len(entries)} 条\n"
-            f"💾 数据库写入 {db_count} 条\n"
-            f"🔧 {method_info}\n"
-            f"📂 {file_path}"
-        )
+        await self._handle_llm_record_output(event, user_key, content, llm_output)
 
     async def terminate(self):
         """插件卸载时调用"""
