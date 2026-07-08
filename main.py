@@ -548,7 +548,7 @@ class LifeOSPlugin(Star):
             parts.append(self._do_local_query('today', today_str))
             parts.append(self._do_local_query('week', today_str))
             parts.append(self._do_local_query('month', today_str))
-            return '\n\n'.join(parts)
+            return ('\n\n' + '─' * 30 + '\n\n').join(parts)
 
         qtype = None
         if clean_input in day_kw:
@@ -579,85 +579,183 @@ class LifeOSPlugin(Star):
             'last30': '📅 近30天统计',
         }
 
+        is_daily = (qtype == 'today')
+
         if qtype == 'today':
+            date_cond = 'WHERE record_date = ?'
             params = [today_str]
-            sql_w = "SELECT SUM(duration), SUM(output_count), COUNT(*) FROM writing_records WHERE record_date = ?"
-            sql_r = "SELECT SUM(duration), SUM(output_count), COUNT(*) FROM reading_records WHERE record_date = ?"
-            grouped = False
+            days_col = '1'
         elif qtype == 'week':
             monday = today - timedelta(days=today.weekday())
+            date_cond = 'WHERE record_date >= ?'
             params = [monday.strftime('%Y-%m-%d')]
-            sql_w = "SELECT record_date, SUM(duration), SUM(output_count), COUNT(*) FROM writing_records WHERE record_date >= ? GROUP BY record_date ORDER BY record_date DESC"
-            sql_r = "SELECT record_date, SUM(duration), SUM(output_count), COUNT(*) FROM reading_records WHERE record_date >= ? GROUP BY record_date ORDER BY record_date DESC"
-            grouped = True
+            days_col = 'COUNT(DISTINCT record_date)'
         elif qtype == 'month':
-            first_day = today.replace(day=1).strftime('%Y-%m-%d')
-            params = [first_day]
-            sql_w = "SELECT record_date, SUM(duration), SUM(output_count), COUNT(*) FROM writing_records WHERE record_date >= ? GROUP BY record_date ORDER BY record_date DESC"
-            sql_r = "SELECT record_date, SUM(duration), SUM(output_count), COUNT(*) FROM reading_records WHERE record_date >= ? GROUP BY record_date ORDER BY record_date DESC"
-            grouped = True
+            date_cond = 'WHERE record_date >= ?'
+            params = [today.replace(day=1).strftime('%Y-%m-%d')]
+            days_col = 'COUNT(DISTINCT record_date)'
         elif qtype == 'last7':
+            date_cond = 'WHERE record_date >= ?'
             params = [(today - timedelta(days=6)).strftime('%Y-%m-%d')]
-            sql_w = "SELECT record_date, SUM(duration), SUM(output_count), COUNT(*) FROM writing_records WHERE record_date >= ? GROUP BY record_date ORDER BY record_date DESC"
-            sql_r = "SELECT record_date, SUM(duration), SUM(output_count), COUNT(*) FROM reading_records WHERE record_date >= ? GROUP BY record_date ORDER BY record_date DESC"
-            grouped = True
+            days_col = 'COUNT(DISTINCT record_date)'
         else:  # last30
+            date_cond = 'WHERE record_date >= ?'
             params = [(today - timedelta(days=29)).strftime('%Y-%m-%d')]
-            sql_w = "SELECT record_date, SUM(duration), SUM(output_count), COUNT(*) FROM writing_records WHERE record_date >= ? GROUP BY record_date ORDER BY record_date DESC"
-            sql_r = "SELECT record_date, SUM(duration), SUM(output_count), COUNT(*) FROM reading_records WHERE record_date >= ? GROUP BY record_date ORDER BY record_date DESC"
-            grouped = True
+            days_col = 'COUNT(DISTINCT record_date)'
+
+        sql_w_detail = f"SELECT work_name, record_type, SUM(duration), SUM(output_count), {days_col} FROM writing_records {date_cond} GROUP BY work_name, record_type"
+        sql_r_detail = f"SELECT work_name, record_type, SUM(duration), SUM(output_count), {days_col} FROM reading_records {date_cond} GROUP BY work_name, record_type"
+        sql_w_total = f"SELECT SUM(duration), SUM(output_count) FROM writing_records {date_cond}"
+        sql_r_total = f"SELECT SUM(duration), SUM(output_count) FROM reading_records {date_cond}"
 
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
-        cursor.execute(sql_w, params)
-        w_rows = cursor.fetchall()
-        cursor.execute(sql_r, params)
-        r_rows = cursor.fetchall()
+        cursor.execute(sql_w_detail, params)
+        w_detail = cursor.fetchall()
+        cursor.execute(sql_r_detail, params)
+        r_detail = cursor.fetchall()
+        cursor.execute(sql_w_total, params)
+        w_total = cursor.fetchone()
+        cursor.execute(sql_r_total, params)
+        r_total = cursor.fetchone()
         conn.close()
 
-        lines = [titles[qtype], '']
+        if is_daily:
+            return self._format_daily(w_total, r_total, w_detail, r_detail, titles[qtype])
+        else:
+            return self._format_period(w_total, r_total, w_detail, r_detail, titles[qtype])
 
-        lines.append('✍️ 写作：')
-        w_text = self._format_local_rows(w_rows, grouped, 'word')
-        lines.append(w_text if w_text else '  暂无数据')
+    def _format_daily(self, w_total, r_total, w_detail, r_detail, title: str) -> str:
+        """格式化每日查询结果：总量行 + 详情（全部展示，合并同类项）"""
+        lines = [title, '']
+        lines.append(self._build_total_line(w_total, r_total, '本日'))
         lines.append('')
 
-        lines.append('📖 阅读：')
-        r_text = self._format_local_rows(r_rows, grouped, 'chapter')
-        lines.append(r_text if r_text else '  暂无数据')
+        if w_detail:
+            lines.append('✍️ 写作详情：')
+            for item in self._sort_and_rank(w_detail, 'write'):
+                lines.append(f'  {item}')
+            lines.append('')
+
+        if r_detail:
+            lines.append('📖 阅读详情：')
+            for item in self._sort_and_rank(r_detail, 'read'):
+                lines.append(f'  {item}')
 
         return '\n'.join(lines)
 
-    def _format_local_rows(self, rows: list, grouped: bool, metric: str) -> str:
-        """格式化本地查询的行数据。metric: 'word' | 'chapter'"""
-        unit = '字' if metric == 'word' else '章'
+    def _format_period(self, w_total, r_total, w_detail, r_detail, title: str) -> str:
+        """格式化周期查询结果：总量行 + TOP 3（合并同类项，有作品名绝对优先）"""
+        lines = [title, '']
 
-        if not rows:
-            return ''
+        prefix = title.replace('📅 ', '')
+        lines.append(self._build_total_line(w_total, r_total, prefix))
+        lines.append('')
 
-        if grouped:
-            total_dur = 0.0
-            total_out = 0
-            total_days = 0
-            for row in rows:
-                if row[3] is not None and row[3] > 0:
-                    total_dur += row[1] or 0
-                    total_out += int(row[2] or 0)
-                    total_days += 1
-            if total_days == 0:
-                return ''
-            lines = [
-                f'  总时长：{total_dur:.2f} 小时',
-                f'  总{unit}数：{total_out} {unit}',
-                f'  有记录天数：{total_days} 天',
-            ]
-            return '\n'.join(lines)
+        if w_detail:
+            lines.append('✍️ 写作 TOP 3：')
+            for i, item in enumerate(self._sort_and_rank(w_detail, 'write', top_n=3), 1):
+                lines.append(f'  {i}. {item}')
+            lines.append('')
+
+        if r_detail:
+            lines.append('📖 阅读 TOP 3：')
+            for i, item in enumerate(self._sort_and_rank(r_detail, 'read', top_n=3), 1):
+                lines.append(f'  {i}. {item}')
+
+        return '\n'.join(lines)
+
+    def _build_total_line(self, w_total, r_total, prefix: str) -> str:
+        """构建总量行。不计作品名分类，只分读写两个大类。
+        格式：'本日你阅读了X小时看了X章，写了X小时X字。'"""
+        w_dur = w_total[0] or 0 if w_total else 0
+        w_out = w_total[1] or 0 if w_total else 0
+        r_dur = r_total[0] or 0 if r_total else 0
+        r_out = r_total[1] or 0 if r_total else 0
+
+        read_parts = []
+        if r_dur > 0:
+            read_parts.append(f'阅读了{r_dur:.2f}小时')
+        if r_out > 0:
+            read_parts.append(f'看了{int(r_out)}章')
+
+        write_parts = []
+        if w_dur > 0:
+            write_parts.append(f'写了{w_dur:.2f}小时')
+        if w_out > 0:
+            write_parts.append(f'{int(w_out)}字')
+
+        read_str = ''.join(read_parts)
+        write_str = ''.join(write_parts)
+
+        if read_str and write_str:
+            return f'{prefix}你{read_str}，{write_str}。'
+        elif read_str:
+            return f'{prefix}你{read_str}。'
+        elif write_str:
+            return f'{prefix}你{write_str}。'
         else:
-            # 单行聚合
-            row = rows[0]
-            if row is None or row[2] is None or row[2] == 0:
-                return ''
-            return f'  时长：{row[0] or 0:.2f} 小时 | {unit}数：{int(row[1] or 0)} {unit}'
+            return f'{prefix}暂无记录。'
+
+    def _sort_and_rank(self, rows: list, metric_type: str, top_n: int = None) -> list:
+        """
+        排序并格式化详情行。
+        排序规则：有作品名绝对优先 > 有 output_count 优先 > 按数值降序。
+        metric_type: 'write' | 'read'
+        top_n: 取前 N 名，附加 (N天) 后缀
+        """
+        coefficient = 2000 if metric_type == 'write' else 20
+
+        def sort_key(row):
+            work_name = row[0]
+            output = row[3] or 0
+            duration = row[2] or 0
+            has_work = 1 if work_name else 0
+            has_output = 1 if output else 0
+            score = output if output else duration * coefficient
+            return (has_work, has_output, score)
+
+        sorted_rows = sorted(rows, key=sort_key, reverse=True)
+
+        if top_n:
+            sorted_rows = sorted_rows[:top_n]
+
+        items = []
+        for row in sorted_rows:
+            item = self._format_detail_item(row, metric_type)
+            if top_n:
+                days = row[4] or 1
+                item += f'（{days}天）'
+            items.append(item)
+
+        return items
+
+    def _format_detail_item(self, row: tuple, metric_type: str) -> str:
+        """
+        格式化单条详情。优先用字数/章节，没有时才用时长。
+        row: (work_name, record_type, duration, output_count, day_count)
+        """
+        work_name = row[0] or ''
+        record_type = row[1] or ''
+        duration = row[2] or 0
+        output = row[3] or 0
+
+        unit = '字' if metric_type == 'write' else '章'
+
+        prefix = ''
+        if work_name:
+            prefix += f'《{work_name}》'
+        if record_type:
+            prefix += record_type
+
+        if output:
+            value = f'{int(output)} {unit}'
+        elif duration:
+            value = f'{duration:.2f} 小时'
+        else:
+            value = '0'
+
+        return f'{prefix} {value}'
 
     def _parse_intent_from_markdown(self, markdown: str) -> dict:
         """解析 LLM 意图输出为 dict"""
