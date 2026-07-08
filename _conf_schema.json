@@ -11,6 +11,12 @@
     "default": "/data/lifeos/Config",
     "hint": "插件首次启动会自动从 rules/ 复制默认规则到此目录。修改后需重载插件生效。"
   },
+  "db_path": {
+    "description": "SQLite 数据库文件路径",
+    "type": "string",
+    "default": "/data/lifeos/Database/lifeos.db",
+    "hint": "用于存储结构化的写作/阅读记录，供统计分析。"
+  },
   "llm_provider": {
     "description": "LLM 提供商（留空则使用 AstrBot 当前默认）",
     "type": "string",
