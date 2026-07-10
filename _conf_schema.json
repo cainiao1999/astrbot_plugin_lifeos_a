@@ -25,7 +25,7 @@
   },
   "schedule_enabled": {
     "description": "是否启用定时推送",
-    "type": "boolean",
+    "type": "bool",
     "default": true,
     "hint": "开启后，每日/每周/每月定时向订阅用户推送读写数据报告。"
   },
