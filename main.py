@@ -1359,8 +1359,12 @@ class LifeOSPlugin(Star):
             f"{rule_text}"
         ) if persona_prompt else rule_text
 
-        data_text = self._format_report_data(data, report_type)
-        user_prompt = f"请根据上述规则，为以下数据生成报告：\n\n{data_text}"
+        data_text = self._format_report_data(data, report_type, now)
+        user_prompt = (
+            f"当前日期时间：{now.strftime('%Y年%m月%d日 %H:%M')}\n\n"
+            f"{data_text}\n\n"
+            f"请根据上述规则生成报告。"
+        )
 
         # 调用 LLM
         message = None
@@ -1499,9 +1503,13 @@ class LifeOSPlugin(Star):
 
     # ──────────── 报告格式化 ────────────
 
-    def _format_report_data(self, data: dict, report_type: str) -> str:
+    def _format_report_data(self, data: dict, report_type: str, now: datetime = None) -> str:
         """将收集的数据格式化为 LLM 可读文本"""
+        type_names = {'daily': '今日', 'weekly': '上周', 'monthly': '上月'}
+        prefix = type_names.get(report_type, '')
         lines = []
+        if now:
+            lines.append(f"当前时间：{now.strftime('%Y-%m-%d %H:%M')}，报告类型：{prefix}")
         w = data.get('writing_total', {})
         r = data.get('reading_total', {})
 
