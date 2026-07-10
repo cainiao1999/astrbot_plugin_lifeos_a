@@ -22,5 +22,29 @@
     "type": "string",
     "default": "",
     "hint": "可选：指定使用的 AI 模型，如 openai/gpt-4o。留空则使用系统默认。"
+  },
+  "schedule_enabled": {
+    "description": "是否启用定时推送",
+    "type": "boolean",
+    "default": true,
+    "hint": "开启后，每日/每周/每月定时向订阅用户推送读写数据报告。"
+  },
+  "schedule_daily_times": {
+    "description": "每日推送时间（HH:MM，逗号分隔）",
+    "type": "string",
+    "default": "08:00,14:00,20:00",
+    "hint": "每天在这些时间点推送当日读写统计。修改后需重载插件生效。"
+  },
+  "schedule_weekly_time": {
+    "description": "每周推送时间（周一触发，HH:MM）",
+    "type": "string",
+    "default": "08:30",
+    "hint": "每周一在此时间推送上周读写总结。"
+  },
+  "schedule_monthly_time": {
+    "description": "每月推送时间（1日触发，HH:MM）",
+    "type": "string",
+    "default": "08:35",
+    "hint": "每月 1 日在此时间推送上月读写总结。"
   }
 }
