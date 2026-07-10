@@ -3,9 +3,10 @@ from datetime import datetime, timedelta
 import shutil
 import re
 import sqlite3
+import asyncio
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 
@@ -23,6 +24,8 @@ class LifeOSPlugin(Star):
         self.config_path = Path(self.config.get('config_path', '/data/lifeos/Config'))
         self.db_path = Path(self.config.get('db_path', '/data/lifeos/Database/lifeos.db'))
         self.pending = {}  # {user_id: {'original': str, 'question': str, 'timestamp': datetime}}
+        self._scheduler_running = False
+        self._scheduler_task = None
 
     async def initialize(self):
         """插件初始化：创建目录结构，复制默认规则"""
@@ -30,6 +33,10 @@ class LifeOSPlugin(Star):
         self.config_path.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_rule_files()
+        self._ensure_push_log_table()
+        if self.config.get('schedule_enabled', True):
+            self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+            logger.info("LifeOS 定时推送已启动")
         logger.info(f"LifeOS 初始化完成")
         logger.info(f"  数据目录：{self.data_path}")
         logger.info(f"  配置目录：{self.config_path}")
@@ -615,18 +622,25 @@ class LifeOSPlugin(Star):
 
         result = '已成功记录，' + '，'.join(new_items) if new_items else '已成功记录'
 
+        # 从记录中提取 user_id
+        user_id = ''
+        for r in records:
+            if r:
+                user_id = r.get('user_id', '')
+                break
+
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
 
         cursor.execute(
-            "SELECT COALESCE(SUM(duration), 0), COALESCE(SUM(output_count), 0) FROM writing_records WHERE record_date = ?",
-            (today_str,)
+            "SELECT COALESCE(SUM(duration), 0), COALESCE(SUM(output_count), 0) FROM writing_records WHERE record_date = ? AND user_id = ?",
+            (today_str, user_id)
         )
         w_dur, w_out = cursor.fetchone()
 
         cursor.execute(
-            "SELECT COALESCE(SUM(duration), 0), COALESCE(SUM(output_count), 0) FROM reading_records WHERE record_date = ?",
-            (today_str,)
+            "SELECT COALESCE(SUM(duration), 0), COALESCE(SUM(output_count), 0) FROM reading_records WHERE record_date = ? AND user_id = ?",
+            (today_str, user_id)
         )
         r_dur, r_out = cursor.fetchone()
         conn.close()
@@ -780,6 +794,7 @@ class LifeOSPlugin(Star):
         # 有效记录：修正时间、提取字段、写入
         now = datetime.now().strftime('%H:%M')
         today = datetime.now().strftime('%Y-%m-%d')
+        sender_id = event.get_sender_id()
         llm_output = self._force_current_time(llm_output)
 
         # 按 —————— 拆分多条记录
@@ -790,6 +805,8 @@ class LifeOSPlugin(Star):
             full_entry = entry.strip() + '\n——————'
             all_md.append(full_entry)
             record = self._extract_record_from_markdown(full_entry, today)
+            if record:
+                record['user_id'] = sender_id
             all_records.append(record)
 
         db_count = self._write_to_db(all_records)
@@ -799,7 +816,7 @@ class LifeOSPlugin(Star):
 
     # ──────────── 查询功能 ────────────
 
-    def _query_local(self, clean_input: str):
+    def _query_local(self, clean_input: str, user_id: str = ''):
         """白名单本地查询。匹配返回格式化文本，不匹配返回 None。"""
         today_str = datetime.now().strftime('%Y-%m-%d')
 
@@ -811,9 +828,9 @@ class LifeOSPlugin(Star):
 
         if not clean_input:
             parts = []
-            parts.append(self._do_local_query('today', today_str))
-            parts.append(self._do_local_query('week', today_str))
-            parts.append(self._do_local_query('month', today_str))
+            parts.append(self._do_local_query('today', today_str, user_id))
+            parts.append(self._do_local_query('week', today_str, user_id))
+            parts.append(self._do_local_query('month', today_str, user_id))
             return ('\n\n' + '─' * 30 + '\n\n').join(parts)
 
         qtype = None
@@ -829,11 +846,11 @@ class LifeOSPlugin(Star):
             qtype = 'last30'
 
         if qtype:
-            return self._do_local_query(qtype, today_str)
+            return self._do_local_query(qtype, today_str, user_id)
 
         return None
 
-    def _do_local_query(self, qtype: str, today_str: str) -> str:
+    def _do_local_query(self, qtype: str, today_str: str, user_id: str = '') -> str:
         """执行本地查询并格式化结果"""
         today = datetime.strptime(today_str, '%Y-%m-%d')
 
@@ -868,6 +885,9 @@ class LifeOSPlugin(Star):
             date_cond = 'WHERE record_date >= ?'
             params = [(today - timedelta(days=29)).strftime('%Y-%m-%d')]
             days_col = 'COUNT(DISTINCT record_date)'
+
+        date_cond += ' AND user_id = ?'
+        params.append(user_id)
 
         sql_w_detail = f"SELECT work_name, GROUP_CONCAT(DISTINCT record_type), SUM(duration), SUM(output_count), {days_col} FROM writing_records {date_cond} GROUP BY work_name"
         sql_r_detail = f"SELECT work_name, GROUP_CONCAT(DISTINCT record_type), SUM(duration), SUM(output_count), {days_col} FROM reading_records {date_cond} GROUP BY work_name"
@@ -1071,7 +1091,7 @@ class LifeOSPlugin(Star):
 
         return result
 
-    def _build_sql_for_intent(self, intent: dict, today_str: str) -> list:
+    def _build_sql_for_intent(self, intent: dict, today_str: str, user_id: str = '') -> list:
         """从意图 dict 构建 SQL 查询列表。返回 [(table_name, sql, params), ...]"""
         today = datetime.strptime(today_str, '%Y-%m-%d')
         queries = []
@@ -1082,6 +1102,13 @@ class LifeOSPlugin(Star):
 
         for tr in all_time_ranges:
             date_cond, params_base = self._time_range_to_sql(tr, today)
+
+            # 用户过滤
+            if date_cond:
+                date_cond += ' AND user_id = ?'
+            else:
+                date_cond = 'WHERE user_id = ?'
+            params_base.append(user_id)
 
             # 作品过滤
             if intent['作品名称']:
@@ -1205,6 +1232,321 @@ class LifeOSPlugin(Star):
 
         return '\n'.join(lines)
 
+    # ──────────── 订阅与推送 ────────────
+
+    def _ensure_push_log_table(self):
+        """创建推送日志表（防重复）"""
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS push_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                push_type TEXT NOT NULL,
+                push_key TEXT NOT NULL,
+                pushed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, push_type, push_key)
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def _ensure_subscription(self, event: AstrMessageEvent):
+        """自动注册订阅：用户首次使用 /记录 或 /查询 时写入"""
+        user_id = event.get_sender_id()
+        umo = event.unified_msg_origin
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO subscriptions (user_id, umo) VALUES (?, ?)",
+            (user_id, umo)
+        )
+        conn.commit()
+        conn.close()
+
+    # ──────────── 调度器 ────────────
+
+    async def _scheduler_loop(self):
+        """后台调度循环，每 30 秒检查一次推送时机"""
+        self._scheduler_running = True
+        while self._scheduler_running:
+            try:
+                now = datetime.now()
+                await self._check_daily_push(now)
+                await self._check_weekly_push(now)
+                await self._check_monthly_push(now)
+            except Exception as e:
+                logger.error(f"调度器异常：{e}")
+            await asyncio.sleep(30)
+
+    async def _check_daily_push(self, now: datetime):
+        """检查并执行每日推送"""
+        config_times = self.config.get('schedule_daily_times', '08:00,14:00,20:00')
+        times = [t.strip() for t in config_times.split(',')]
+        current_time = now.strftime('%H:%M')
+        if current_time not in times:
+            return
+        today = now.strftime('%Y-%m-%d')
+        push_key = f"{today}_{current_time}"
+        await self._try_push('daily', push_key, now)
+
+    async def _check_weekly_push(self, now: datetime):
+        """检查并执行每周推送（周一触发）"""
+        config_time = self.config.get('schedule_weekly_time', '08:30')
+        if now.strftime('%H:%M') != config_time or now.weekday() != 0:
+            return
+        push_key = now.strftime('%Y-W%W')
+        await self._try_push('weekly', push_key, now)
+
+    async def _check_monthly_push(self, now: datetime):
+        """检查并执行每月推送（1日触发）"""
+        config_time = self.config.get('schedule_monthly_time', '08:35')
+        if now.strftime('%H:%M') != config_time or now.day != 1:
+            return
+        push_key = now.strftime('%Y-%m')
+        await self._try_push('monthly', push_key, now)
+
+    async def _try_push(self, push_type: str, push_key: str, now: datetime):
+        """对每位订阅用户尝试推送，push_log 防重复"""
+        enabled_field = {'daily': 'daily_enabled', 'weekly': 'weekly_enabled', 'monthly': 'monthly_enabled'}[push_type]
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT user_id, umo FROM subscriptions WHERE {enabled_field} = 1")
+        subs = cursor.fetchall()
+        conn.close()
+        for user_id, umo in subs:
+            try:
+                conn = sqlite3.connect(str(self.db_path))
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO push_log (user_id, push_type, push_key) VALUES (?, ?, ?)",
+                    (user_id, push_type, push_key)
+                )
+                conn.commit()
+                conn.close()
+                await self._send_report(umo, user_id, push_type, now)
+            except sqlite3.IntegrityError:
+                conn.close()
+
+    # ──────────── 报告生成 ────────────
+
+    async def _send_report(self, umo: str, user_id: str, report_type: str, now: datetime):
+        """生成并发送一份报告"""
+        # 收集数据
+        if report_type == 'daily':
+            data = self._collect_daily_data(user_id, now)
+        elif report_type == 'weekly':
+            data = self._collect_weekly_data(user_id, now)
+        else:
+            data = self._collect_monthly_data(user_id, now)
+
+        # 获取人格 prompt
+        try:
+            persona = self.context.persona_manager.get_default_persona_v3(umo=umo)
+            persona_prompt = persona.get('prompt', '') if persona else ''
+        except Exception as e:
+            logger.warning(f"获取人格失败：{e}")
+            persona_prompt = ''
+
+        # 读取报告规则
+        rule_file = {'daily': 'report_daily_rule.md', 'weekly': 'report_weekly_rule.md', 'monthly': 'report_monthly_rule.md'}[report_type]
+        rule_text = self._read_rule(rule_file)
+
+        # 构建 prompt
+        system_prompt = (
+            f"{persona_prompt}\n\n"
+            f"你是 LifeOS 助手。请严格按照下方规则生成报告，保持人格的说话风格。\n\n"
+            f"{rule_text}"
+        ) if persona_prompt else rule_text
+
+        data_text = self._format_report_data(data, report_type)
+        user_prompt = f"请根据上述规则，为以下数据生成报告：\n\n{data_text}"
+
+        # 调用 LLM
+        message = None
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+            if provider_id:
+                llm_resp = await self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=f"{system_prompt}\n\n{user_prompt}",
+                )
+                if llm_resp and hasattr(llm_resp, 'completion_text') and llm_resp.completion_text.strip():
+                    message = llm_resp.completion_text.strip()
+        except Exception as e:
+            logger.warning(f"LLM 报告生成失败：{e}")
+
+        if not message:
+            message = self._format_report_fallback(data, report_type)
+
+        # 发送
+        try:
+            chain = MessageChain().message(message)
+            await self.context.send_message(umo, chain)
+        except Exception as e:
+            logger.error(f"推送消息发送失败：{e}")
+
+    # ──────────── 报告数据收集 ────────────
+
+    def _collect_daily_data(self, user_id: str, now: datetime) -> dict:
+        """收集当日数据"""
+        today = now.strftime('%Y-%m-%d')
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT COALESCE(SUM(duration), 0), COALESCE(SUM(output_count), 0) "
+            "FROM writing_records WHERE record_date = ? AND user_id = ?",
+            (today, user_id)
+        )
+        w_total = cursor.fetchone()
+
+        cursor.execute(
+            "SELECT work_name, GROUP_CONCAT(DISTINCT record_type), COALESCE(SUM(duration), 0), COALESCE(SUM(output_count), 0) "
+            "FROM writing_records WHERE record_date = ? AND user_id = ? GROUP BY work_name",
+            (today, user_id)
+        )
+        w_detail = cursor.fetchall()
+
+        cursor.execute(
+            "SELECT COALESCE(SUM(duration), 0), COALESCE(SUM(output_count), 0) "
+            "FROM reading_records WHERE record_date = ? AND user_id = ?",
+            (today, user_id)
+        )
+        r_total = cursor.fetchone()
+
+        cursor.execute(
+            "SELECT work_name, GROUP_CONCAT(DISTINCT record_type), COALESCE(SUM(duration), 0), COALESCE(SUM(output_count), 0) "
+            "FROM reading_records WHERE record_date = ? AND user_id = ? GROUP BY work_name",
+            (today, user_id)
+        )
+        r_detail = cursor.fetchall()
+        conn.close()
+
+        return {
+            'writing_total': {'words': (w_total[1] or 0) if w_total else 0, 'hours': (w_total[0] or 0) if w_total else 0},
+            'writing_detail': [{'work': r[0] or '', 'type': r[1] or '', 'hours': r[2] or 0, 'output': r[3] or 0} for r in w_detail],
+            'reading_total': {'chapters': (r_total[1] or 0) if r_total else 0, 'hours': (r_total[0] or 0) if r_total else 0},
+            'reading_detail': [{'work': r[0] or '', 'type': r[1] or '', 'hours': r[2] or 0, 'output': r[3] or 0} for r in r_detail],
+        }
+
+    def _collect_weekly_data(self, user_id: str, now: datetime) -> dict:
+        """收集上周数据（周一至周日）"""
+        days_since_monday = now.weekday()
+        last_monday = now - timedelta(days=days_since_monday + 7)
+        last_sunday = last_monday + timedelta(days=6)
+        return self._collect_range_data(user_id, last_monday, last_sunday)
+
+    def _collect_monthly_data(self, user_id: str, now: datetime) -> dict:
+        """收集上月数据"""
+        first_of_this_month = now.replace(day=1)
+        last_of_prev_month = first_of_this_month - timedelta(days=1)
+        first_of_prev_month = last_of_prev_month.replace(day=1)
+        return self._collect_range_data(user_id, first_of_prev_month, last_of_prev_month)
+
+    def _collect_range_data(self, user_id: str, start: datetime, end: datetime) -> dict:
+        """收集日期范围内的数据"""
+        start_str = start.strftime('%Y-%m-%d')
+        end_str = end.strftime('%Y-%m-%d')
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT COALESCE(SUM(duration), 0), COALESCE(SUM(output_count), 0) "
+            "FROM writing_records WHERE record_date >= ? AND record_date <= ? AND user_id = ?",
+            (start_str, end_str, user_id)
+        )
+        w_total = cursor.fetchone()
+
+        cursor.execute(
+            "SELECT work_name, GROUP_CONCAT(DISTINCT record_type), COALESCE(SUM(duration), 0), COALESCE(SUM(output_count), 0) "
+            "FROM writing_records WHERE record_date >= ? AND record_date <= ? AND user_id = ? GROUP BY work_name",
+            (start_str, end_str, user_id)
+        )
+        w_detail = cursor.fetchall()
+
+        cursor.execute(
+            "SELECT COALESCE(SUM(duration), 0), COALESCE(SUM(output_count), 0) "
+            "FROM reading_records WHERE record_date >= ? AND record_date <= ? AND user_id = ?",
+            (start_str, end_str, user_id)
+        )
+        r_total = cursor.fetchone()
+
+        cursor.execute(
+            "SELECT work_name, GROUP_CONCAT(DISTINCT record_type), COALESCE(SUM(duration), 0), COALESCE(SUM(output_count), 0) "
+            "FROM reading_records WHERE record_date >= ? AND record_date <= ? AND user_id = ? GROUP BY work_name",
+            (start_str, end_str, user_id)
+        )
+        r_detail = cursor.fetchall()
+
+        cursor.execute(
+            "SELECT COUNT(DISTINCT record_date) FROM writing_records WHERE record_date >= ? AND record_date <= ? AND user_id = ? "
+            "UNION ALL "
+            "SELECT COUNT(DISTINCT record_date) FROM reading_records WHERE record_date >= ? AND record_date <= ? AND user_id = ?",
+            (start_str, end_str, user_id, start_str, end_str, user_id)
+        )
+        days = cursor.fetchall()
+        active_days = max((days[0][0] or 0) if days else 0, (days[1][0] or 0) if len(days) > 1 else 0)
+        conn.close()
+
+        return {
+            'writing_total': {'words': (w_total[1] or 0) if w_total else 0, 'hours': (w_total[0] or 0) if w_total else 0},
+            'writing_detail': [{'work': r[0] or '', 'type': r[1] or '', 'hours': r[2] or 0, 'output': r[3] or 0} for r in w_detail],
+            'reading_total': {'chapters': (r_total[1] or 0) if r_total else 0, 'hours': (r_total[0] or 0) if r_total else 0},
+            'reading_detail': [{'work': r[0] or '', 'type': r[1] or '', 'hours': r[2] or 0, 'output': r[3] or 0} for r in r_detail],
+            'active_days': active_days,
+        }
+
+    # ──────────── 报告格式化 ────────────
+
+    def _format_report_data(self, data: dict, report_type: str) -> str:
+        """将收集的数据格式化为 LLM 可读文本"""
+        lines = []
+        w = data.get('writing_total', {})
+        r = data.get('reading_total', {})
+
+        lines.append(f"写作总量：{w.get('words', 0)} 字，{w.get('hours', 0):.1f} 小时")
+        if data.get('writing_detail'):
+            lines.append("写作详情：")
+            for d in data['writing_detail']:
+                work = f'《{d["work"]}》' if d['work'] else '未命名作品'
+                lines.append(f"  - {work} {d['type']}: {d['output']} 字，{d['hours']:.1f} 小时")
+
+        lines.append(f"\n阅读总量：{r.get('chapters', 0)} 章，{r.get('hours', 0):.1f} 小时")
+        if data.get('reading_detail'):
+            lines.append("阅读详情：")
+            for d in data['reading_detail']:
+                work = f'《{d["work"]}》' if d['work'] else '未命名作品'
+                lines.append(f"  - {work} {d['type']}: {d['output']} 章，{d['hours']:.1f} 小时")
+
+        if data.get('active_days'):
+            lines.append(f"\n活跃天数：{data['active_days']} 天")
+
+        return '\n'.join(lines)
+
+    def _format_report_fallback(self, data: dict, report_type: str) -> str:
+        """LLM 不可用时本地兜底生成报告文本"""
+        type_names = {'daily': '今日', 'weekly': '上周', 'monthly': '上月'}
+        prefix = type_names.get(report_type, '')
+        w = data.get('writing_total', {})
+        r = data.get('reading_total', {})
+
+        lines = [f'{prefix}读写总结']
+        lines.append('')
+        lines.append(f'✍️ 写作：{w.get("words", 0)} 字，{w.get("hours", 0):.1f} 小时')
+        if data.get('writing_detail'):
+            for d in data['writing_detail']:
+                work = f'《{d["work"]}》' if d['work'] else ''
+                lines.append(f'   {work}{d["type"]}: {d["output"]} 字，{d["hours"]:.1f} 小时')
+        lines.append('')
+        lines.append(f'📖 阅读：{r.get("chapters", 0)} 章，{r.get("hours", 0):.1f} 小时')
+        if data.get('reading_detail'):
+            for d in data['reading_detail']:
+                work = f'《{d["work"]}》' if d['work'] else ''
+                lines.append(f'   {work}{d["type"]}: {d["output"]} 章，{d["hours"]:.1f} 小时')
+
+        return '\n'.join(lines)
+
     # ──────────── 命令入口 ────────────
 
     @filter.command("查询", alias={"query"})
@@ -1221,8 +1563,11 @@ class LifeOSPlugin(Star):
         else:
             content = message
 
+        self._ensure_subscription(event)
+        sender_id = event.get_sender_id()
+
         # 1. 尝试本地白名单
-        local_result = self._query_local(content)
+        local_result = self._query_local(content, sender_id)
         if local_result is not None:
             yield event.plain_result(local_result)
             return
@@ -1264,7 +1609,7 @@ class LifeOSPlugin(Star):
 
         # 2c. 构建并执行查询
         today_str = datetime.now().strftime('%Y-%m-%d')
-        queries = self._build_sql_for_intent(intent, today_str)
+        queries = self._build_sql_for_intent(intent, today_str, sender_id)
 
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
@@ -1357,6 +1702,8 @@ class LifeOSPlugin(Star):
             )
             return
 
+        self._ensure_subscription(event)
+        sender_id = event.get_sender_id()
         self._cleanup_pending()
 
         # 有待确认记录 → 视为对追问的回复
@@ -1393,6 +1740,9 @@ class LifeOSPlugin(Star):
             entries = [r[0] for r in local_results]
             records_list = [r[1] for r in local_results]
             raw_texts = [r[2] for r in local_results]
+            for r in records_list:
+                if r:
+                    r['user_id'] = sender_id
             self._write_records(entries, ['本地'] * len(entries), raw_texts)
             db_count = self._write_to_db(records_list)
             yield event.plain_result(self._format_record_response(records_list))
@@ -1408,6 +1758,9 @@ class LifeOSPlugin(Star):
                 entries = [r[0] for r in local_results]
                 records_list = [r[1] for r in local_results]
                 raw_texts = [r[2] for r in local_results]
+                for r in records_list:
+                    if r:
+                        r['user_id'] = sender_id
                 self._write_records(entries, ['本地(兜底)'] * len(entries), raw_texts)
                 db_count = self._write_to_db(records_list)
                 yield event.plain_result(self._format_record_response(records_list))
@@ -1419,4 +1772,11 @@ class LifeOSPlugin(Star):
 
     async def terminate(self):
         """插件卸载时调用"""
+        self._scheduler_running = False
+        if self._scheduler_task:
+            self._scheduler_task.cancel()
+            try:
+                await self._scheduler_task
+            except asyncio.CancelledError:
+                pass
         logger.info("LifeOS 插件已卸载")
