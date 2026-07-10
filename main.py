@@ -69,8 +69,8 @@ class LifeOSPlugin(Star):
             r'\s*'
             r'(?='
             r'(?:我)?(?:今天)?'
-            r'(?:写了|码了|码字|写作|在写|完成了|写了稿|更了|'
-            r'读了|看了|阅读|在读|在看|翻看)'
+            r'(?:写了|码了|码字|写作|在写|完成了|写了稿|更了|写|'
+            r'读了|看了|阅读|在读|在看|翻看|读)'
             r')'
         )
         parts = re.split(split_pattern, text)
@@ -196,8 +196,8 @@ class LifeOSPlugin(Star):
 
     def _local_parse_single(self, text: str, now: str, today: str) -> tuple:
         """本地解析单个活动描述，返回 (markdown, record_dict)"""
-        writing_kw = ['写了', '码了', '码字', '写作', '在写', '完成了', '写了稿', '更了']
-        reading_kw = ['读了', '看了', '阅读', '在读', '在看', '翻看']
+        writing_kw = ['写了', '码了', '码字', '写作', '在写', '完成了', '写了稿', '更了', '写']
+        reading_kw = ['读了', '看了', '阅读', '在读', '在看', '翻看', '读']
 
         is_writing = any(kw in text for kw in writing_kw)
         is_reading = any(kw in text for kw in reading_kw)
@@ -462,8 +462,8 @@ class LifeOSPlugin(Star):
         尝试本地完美匹配。成功返回 (markdown, dict)，有歧义返回 None。
         歧义条件：类型关键词冲突、作品名与 DB 中已有记录模糊匹配。
         """
-        writing_kw = ['写了', '码了', '码字', '写作', '在写', '完成了', '写了稿', '更了']
-        reading_kw = ['读了', '看了', '阅读', '在读', '在看', '翻看']
+        writing_kw = ['写了', '码了', '码字', '写作', '在写', '完成了', '写了稿', '更了', '写']
+        reading_kw = ['读了', '看了', '阅读', '在读', '在看', '翻看', '读']
 
         is_writing = any(kw in text for kw in writing_kw)
         is_reading = any(kw in text for kw in reading_kw)
