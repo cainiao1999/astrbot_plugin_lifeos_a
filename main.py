@@ -596,9 +596,9 @@ class LifeOSPlugin(Star):
                 if output_count:
                     s = f'{prefix}新增{output_count}字'
                     if duration:
-                        s += f'，耗时{duration:.2f}小时'
+                        s += f'，耗时{duration:.1f}小时'
                 elif duration:
-                    s = f'{prefix}新增写作{duration:.2f}小时'
+                    s = f'{prefix}新增写作{duration:.1f}小时'
                 else:
                     s = f'{prefix}已记录'
                 new_items.append(s)
@@ -606,9 +606,9 @@ class LifeOSPlugin(Star):
                 if output_count:
                     s = f'{prefix}新增{output_count}章'
                     if duration:
-                        s += f'，耗时{duration:.2f}小时'
+                        s += f'，耗时{duration:.1f}小时'
                 elif duration:
-                    s = f'{prefix}新增阅读{duration:.2f}小时'
+                    s = f'{prefix}新增阅读{duration:.1f}小时'
                 else:
                     s = f'{prefix}已记录'
                 new_items.append(s)
@@ -637,7 +637,7 @@ class LifeOSPlugin(Star):
             if w_out > 0:
                 wp.append(f'{int(w_out)}个字')
             if w_dur > 0:
-                wp.append(f'{w_dur:.2f}个小时')
+                wp.append(f'{w_dur:.1f}个小时')
             today_parts.append(f'您今日共写了{"，".join(wp)}')
 
         if r_out > 0 or r_dur > 0:
@@ -645,7 +645,7 @@ class LifeOSPlugin(Star):
             if r_out > 0:
                 rp.append(f'{int(r_out)}章')
             if r_dur > 0:
-                rp.append(f'{r_dur:.2f}个小时')
+                rp.append(f'{r_dur:.1f}个小时')
             today_parts.append(f'您今日共读了{"，".join(rp)}')
 
         if today_parts:
@@ -942,16 +942,16 @@ class LifeOSPlugin(Star):
 
         if r_out > 0 or r_dur > 0:
             if r_out > 0:
-                r_line = f'你共阅读了{int(r_out)}章，用时{r_dur:.2f}小时'
+                r_line = f'你共阅读了{int(r_out)}章，用时{r_dur:.1f}小时'
             else:
-                r_line = f'你共阅读了{r_dur:.2f}小时'
+                r_line = f'你共阅读了{r_dur:.1f}小时'
             lines.append(r_line)
 
         if w_out > 0 or w_dur > 0:
             if w_out > 0:
-                w_line = f'共写下了{int(w_out)}字，用时{w_dur:.2f}小时'
+                w_line = f'共写下了{int(w_out)}字，用时{w_dur:.1f}小时'
             else:
-                w_line = f'共写了{w_dur:.2f}小时'
+                w_line = f'共写了{w_dur:.1f}小时'
             lines.append(w_line)
 
         if not lines:
@@ -1017,12 +1017,12 @@ class LifeOSPlugin(Star):
         if output:
             value = f'{int(output)} {unit}'
         elif duration:
-            value = f'{duration:.2f} 小时'
+            value = f'{duration:.1f} 小时'
         else:
             value = '0'
 
         dur_label = '总用时' if is_period else '用时'
-        dur_str = f'，{dur_label}{duration:.2f}小时' if duration else f'，{dur_label}0小时'
+        dur_str = f'，{dur_label}{duration:.1f}小时' if duration else f'，{dur_label}0小时'
 
         return f'{prefix} {value}{dur_str}'
 
