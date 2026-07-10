@@ -932,40 +932,45 @@ class LifeOSPlugin(Star):
         return '\n'.join(lines)
 
     def _build_total_line(self, w_total, r_total, prefix: str) -> str:
-        """构建总量行。不计作品名分类，只分读写两个大类。
-        格式：'本日你阅读了X小时看了X章，写了X小时X字。'"""
+        """构建总量行。一并展示产出量和时长，缺省时填0小时。"""
         w_dur = w_total[0] or 0 if w_total else 0
         w_out = w_total[1] or 0 if w_total else 0
         r_dur = r_total[0] or 0 if r_total else 0
         r_out = r_total[1] or 0 if r_total else 0
 
-        read_str = ''
-        if r_out > 0:
-            read_str = f'共阅读了{int(r_out)}章'
-        elif r_dur > 0:
-            read_str = f'共阅读了{r_dur:.2f}小时'
+        lines = []
 
-        write_str = ''
-        if w_out > 0:
-            write_str = f'共写下了{int(w_out)}字'
-        elif w_dur > 0:
-            write_str = f'共写了{w_dur:.2f}小时'
+        if r_out > 0 or r_dur > 0:
+            if r_out > 0:
+                r_line = f'你共阅读了{int(r_out)}章，用时{r_dur:.2f}小时'
+            else:
+                r_line = f'你共阅读了{r_dur:.2f}小时'
+            lines.append(r_line)
 
-        if read_str and write_str:
-            return f'{prefix}你{read_str}，{write_str}。'
-        elif read_str:
-            return f'{prefix}你{read_str}。'
-        elif write_str:
-            return f'{prefix}你{write_str}。'
-        else:
+        if w_out > 0 or w_dur > 0:
+            if w_out > 0:
+                w_line = f'共写下了{int(w_out)}字，用时{w_dur:.2f}小时'
+            else:
+                w_line = f'共写了{w_dur:.2f}小时'
+            lines.append(w_line)
+
+        if not lines:
             return f'{prefix}暂无记录。'
+
+        if len(lines) == 2:
+            return f'{prefix}{lines[0]}。\n{lines[1]}。'
+        else:
+            line = lines[0]
+            if not line.startswith('你'):
+                line = '你' + line
+            return f'{prefix}{line}。'
 
     def _sort_and_rank(self, rows: list, metric_type: str, top_n: int = None) -> list:
         """
         排序并格式化详情行。
         排序规则：有作品名绝对优先 > 有 output_count 优先 > 按数值降序。
         metric_type: 'write' | 'read'
-        top_n: 取前 N 名，附加 (N天) 后缀
+        top_n: 取前 N 名
         """
         coefficient = 2000 if metric_type == 'write' else 20
 
@@ -984,18 +989,16 @@ class LifeOSPlugin(Star):
             sorted_rows = sorted_rows[:top_n]
 
         items = []
+        is_period = top_n is not None
         for row in sorted_rows:
-            item = self._format_detail_item(row, metric_type)
-            if top_n:
-                days = row[4] or 1
-                item += f'（{days}天）'
+            item = self._format_detail_item(row, metric_type, is_period)
             items.append(item)
 
         return items
 
-    def _format_detail_item(self, row: tuple, metric_type: str) -> str:
+    def _format_detail_item(self, row: tuple, metric_type: str, is_period: bool = False) -> str:
         """
-        格式化单条详情。优先用字数/章节，没有时才用时长。
+        格式化单条详情。优先用字数/章节，同时展示时长，缺省填0小时。
         row: (work_name, record_type, duration, output_count, day_count)
         """
         work_name = row[0] or ''
@@ -1018,7 +1021,10 @@ class LifeOSPlugin(Star):
         else:
             value = '0'
 
-        return f'{prefix} {value}'
+        dur_label = '总用时' if is_period else '用时'
+        dur_str = f'，{dur_label}{duration:.2f}小时' if duration else f'，{dur_label}0小时'
+
+        return f'{prefix} {value}{dur_str}'
 
     def _parse_intent_from_markdown(self, markdown: str) -> dict:
         """解析 LLM 意图输出为 dict"""
