@@ -224,7 +224,7 @@ class LifeOSPlugin(Star):
         total_hours = 0.0
         has_duration = False
 
-        m = re.search(r'(\d+(?:\.\d+)?)\s*(小时|h)', text)
+        m = re.search(r'(\d+(?:\.\d+)?)\s*个?\s*(小时|h)', text)
         if m:
             total_hours += float(m.group(1))
             has_duration = True
@@ -323,7 +323,7 @@ class LifeOSPlugin(Star):
         total_hours = 0.0
         has_duration = False
 
-        m = re.search(r'(\d+(?:\.\d+)?)\s*(小时|h)', text)
+        m = re.search(r'(\d+(?:\.\d+)?)\s*个?\s*(小时|h)', text)
         if m:
             total_hours += float(m.group(1))
             has_duration = True
@@ -410,7 +410,7 @@ class LifeOSPlugin(Star):
         has_duration = False
         note = text
 
-        m = re.search(r'(\d+(?:\.\d+)?)\s*(小时|h)', text)
+        m = re.search(r'(\d+(?:\.\d+)?)\s*个?\s*(小时|h)', text)
         if m:
             total_hours += float(m.group(1))
             has_duration = True
